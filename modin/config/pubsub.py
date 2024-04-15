@@ -13,11 +13,85 @@
 
 """Module houses ``Parameter`` class - base class for all configs."""
 
-import collections
-import typing
+import contextlib
+import warnings
+from collections import defaultdict
+from enum import IntEnum
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    DefaultDict,
+    Iterator,
+    NamedTuple,
+    Optional,
+    Tuple,
+    cast,
+)
+
+if TYPE_CHECKING:
+    from modin.config.envvars import EnvironmentVariable
 
 
-class TypeDescriptor(typing.NamedTuple):
+class DeprecationDescriptor:
+    """
+    Describe deprecated parameter.
+
+    Parameters
+    ----------
+    parameter : type[Parameter]
+        Deprecated parameter.
+    new_parameter : type[Parameter], optional
+        If there's a replacement parameter for the deprecated one, specify it here.
+    when_removed : str, optional
+        If known, the exact release when the deprecated parameter is planned to be removed.
+    """
+
+    _parameter: type["Parameter"]
+    _new_parameter: Optional[type["Parameter"]]
+    _when_removed: str
+
+    def __init__(
+        self,
+        parameter: type["Parameter"],
+        new_parameter: Optional[type["Parameter"]] = None,
+        when_removed: Optional[str] = None,
+    ):
+        self._parameter = parameter
+        self._new_parameter = new_parameter
+        self._when_removed = "a future" if when_removed is None else when_removed
+
+    def deprecation_message(self, use_envvar_names: bool = False) -> str:
+        """
+        Generate a message to be used in a warning raised when using the deprecated parameter.
+
+        Parameters
+        ----------
+        use_envvar_names : bool, default: False
+            Whether to use environment variable names in the warning. If ``True``, both
+            ``self._parameter`` and ``self._new_parameter`` have to be a type of ``EnvironmentVariable``.
+
+        Returns
+        -------
+        str
+        """
+        name = (
+            cast("EnvironmentVariable", self._parameter).varname
+            if use_envvar_names
+            else self._parameter.__name__
+        )
+        msg = f"'{name}' is deprecated and will be removed in {self._when_removed} version."
+        if self._new_parameter is not None:
+            new_name = (
+                cast("EnvironmentVariable", self._new_parameter).varname
+                if use_envvar_names
+                else self._new_parameter.__name__
+            )
+            msg += f" Use '{new_name}' instead."
+        return msg
+
+
+class TypeDescriptor(NamedTuple):
     """
     Class for config data manipulating of exact type.
 
@@ -35,9 +109,9 @@ class TypeDescriptor(typing.NamedTuple):
         Class description string.
     """
 
-    decode: typing.Callable[[str], object]
-    normalize: typing.Callable[[object], object]
-    verify: typing.Callable[[object], bool]
+    decode: Callable[[str], object]
+    normalize: Callable[[object], object]
+    verify: Callable[[object], bool]
     help: str
 
 
@@ -48,7 +122,7 @@ class ExactStr(str):
 _TYPE_PARAMS = {
     str: TypeDescriptor(
         decode=lambda value: value.strip().title(),
-        normalize=lambda value: value.strip().title(),
+        normalize=lambda value: str(value).strip().title(),
         verify=lambda value: True,
         help="a case-insensitive string",
     ),
@@ -70,7 +144,7 @@ _TYPE_PARAMS = {
     ),
     int: TypeDescriptor(
         decode=lambda value: int(value.strip()),
-        normalize=int,
+        normalize=int,  # type: ignore
         verify=lambda value: isinstance(value, int)
         or (isinstance(value, str) and value.strip().isdigit()),
         help="an integer value",
@@ -81,13 +155,15 @@ _TYPE_PARAMS = {
             for key_value in value.split(",")
             for key, val in [[v.strip() for v in key_value.split("=", maxsplit=1)]]
         },
-        normalize=lambda value: value
-        if isinstance(value, dict)
-        else {
-            key: int(val) if val.isdigit() else val
-            for key_value in value.split(",")
-            for key, val in [[v.strip() for v in key_value.split("=", maxsplit=1)]]
-        },
+        normalize=lambda value: (
+            value
+            if isinstance(value, dict)
+            else {
+                key: int(val) if val.isdigit() else val
+                for key_value in str(value).split(",")
+                for key, val in [[v.strip() for v in key_value.split("=", maxsplit=1)]]
+            }
+        ),
         verify=lambda value: isinstance(value, dict)
         or (
             isinstance(value, str)
@@ -105,7 +181,7 @@ _TYPE_PARAMS = {
 _UNSET = object()
 
 
-class ValueSource:
+class ValueSource(IntEnum):  # noqa: PR01
     """Class that describes the method of getting the value for a parameter."""
 
     # got from default, i.e. neither user nor configuration source had the value
@@ -122,24 +198,30 @@ class Parameter(object):
 
     Attributes
     ----------
-    choices : sequence of str
+    choices : Optional[Sequence[str]]
         Array with possible options of ``Parameter`` values.
     type : str
         String that denotes ``Parameter`` type.
-    default : Any
+    default : Optional[Any]
         ``Parameter`` default value.
     is_abstract : bool, default: True
         Whether or not ``Parameter`` is abstract.
-    _value_source : int
+    _value_source : Optional[ValueSource]
         Source of the ``Parameter`` value, should be set by
         ``ValueSource``.
+    _deprecation_descriptor : Optional[DeprecationDescriptor]
+        Indicate whether this parameter is deprecated.
     """
 
-    choices: typing.Sequence[str] = None
+    choices: Optional[Tuple[str, ...]] = None
     type = str
-    default = None
+    default: Optional[Any] = None
     is_abstract = True
-    _value_source = None
+    _value_source: Optional[ValueSource] = None
+    _value: Any = _UNSET
+    _subs: list = []
+    _once: DefaultDict[Any, list] = defaultdict(list)
+    _deprecation_descriptor: Optional[DeprecationDescriptor] = None
 
     @classmethod
     def _get_raw_from_config(cls) -> str:
@@ -178,7 +260,7 @@ class Parameter(object):
         """
         raise NotImplementedError()
 
-    def __init_subclass__(cls, type, abstract=False, **kw):
+    def __init_subclass__(cls, type: Any, abstract: bool = False, **kw: dict):
         """
         Initialize subclass.
 
@@ -196,11 +278,11 @@ class Parameter(object):
         cls.is_abstract = abstract
         cls._value = _UNSET
         cls._subs = []
-        cls._once = collections.defaultdict(list)
+        cls._once = defaultdict(list)
         super().__init_subclass__(**kw)
 
     @classmethod
-    def subscribe(cls, callback):
+    def subscribe(cls, callback: Callable) -> None:
         """
         Add `callback` to the `_subs` list and then execute it.
 
@@ -213,7 +295,7 @@ class Parameter(object):
         callback(cls)
 
     @classmethod
-    def _get_default(cls):
+    def _get_default(cls) -> Any:
         """
         Get default value of the config.
 
@@ -224,21 +306,24 @@ class Parameter(object):
         return cls.default
 
     @classmethod
-    def get_value_source(cls):
+    def get_value_source(cls) -> ValueSource:
         """
         Get value source of the config.
 
         Returns
         -------
-        int
+        ValueSource
         """
         if cls._value_source is None:
             # dummy call to .get() to initialize the value
             cls.get()
+        assert (
+            cls._value_source is not None
+        ), "_value_source must be initialized by now in get()"
         return cls._value_source
 
     @classmethod
-    def get(cls):
+    def get(cls) -> Any:
         """
         Get config value.
 
@@ -247,6 +332,10 @@ class Parameter(object):
         Any
             Decoded and verified config value.
         """
+        if cls._deprecation_descriptor is not None:
+            warnings.warn(
+                cls._deprecation_descriptor.deprecation_message(), FutureWarning
+            )
         if cls._value is _UNSET:
             # get the value from env
             try:
@@ -262,7 +351,7 @@ class Parameter(object):
         return cls._value
 
     @classmethod
-    def put(cls, value):
+    def put(cls, value: Any) -> None:
         """
         Set config value.
 
@@ -271,11 +360,15 @@ class Parameter(object):
         value : Any
             Config value to set.
         """
+        if cls._deprecation_descriptor is not None:
+            warnings.warn(
+                cls._deprecation_descriptor.deprecation_message(), FutureWarning
+            )
         cls._check_callbacks(cls._put_nocallback(value))
         cls._value_source = ValueSource.SET_BY_USER
 
     @classmethod
-    def once(cls, onvalue, callback):
+    def once(cls, onvalue: Any, callback: Callable) -> None:
         """
         Execute `callback` if config value matches `onvalue` value.
 
@@ -296,7 +389,7 @@ class Parameter(object):
             cls._once[onvalue].append(callback)
 
     @classmethod
-    def _put_nocallback(cls, value):
+    def _put_nocallback(cls, value: Any) -> Any:
         """
         Set config value without executing callbacks.
 
@@ -317,7 +410,7 @@ class Parameter(object):
         return oldvalue
 
     @classmethod
-    def _check_callbacks(cls, oldvalue):
+    def _check_callbacks(cls, oldvalue: Any) -> None:
         """
         Execute all needed callbacks if config value was changed.
 
@@ -333,5 +426,74 @@ class Parameter(object):
         for callback in cls._once.pop(cls.get(), ()):
             callback(cls)
 
+    @classmethod
+    def add_option(cls, choice: Any) -> Any:
+        """
+        Add a new choice for the parameter.
 
-__all__ = ["Parameter"]
+        Parameters
+        ----------
+        choice : Any
+            New choice to add to the available choices.
+
+        Returns
+        -------
+        Any
+            Added choice normalized according to the parameter type.
+        """
+        if cls.choices is not None:
+            if not _TYPE_PARAMS[cls.type].verify(choice):
+                raise ValueError(f"Unsupported choice value: {choice}")
+            choice = _TYPE_PARAMS[cls.type].normalize(choice)
+            if choice not in cls.choices:
+                cls.choices += (choice,)
+            return choice
+        raise TypeError("Cannot add a choice to a parameter where choices is None")
+
+
+@contextlib.contextmanager
+def context(**config: dict[str, Any]) -> Iterator[None]:
+    """
+    Set a value(s) for the specified config(s) from ``modin.config`` in the scope of the context.
+
+    Parameters
+    ----------
+    **config : dict[str, Any]
+        Keyword describing a name of a config variable from ``modin.config`` as a key
+        and a new value as a value.
+
+    Examples
+    --------
+    >>> RangePartitioning.get()
+    False
+    >>> with context(RangePartitioning=True):
+    ...     print(RangePartitioning.get()) # True
+    True
+    False
+    >>> RangePartitioning.get()
+    False
+    >>> with context(RangePartitioning=True, AsyncReadMode=True):
+    ...     print(RangePartitioning.get()) # True
+    ...     print(AsyncReadMode.get()) # True
+    True
+    True
+    >>> RangePartitioning.get()
+    False
+    >>> AsyncReadMode.get()
+    False
+    """
+    import modin.config as cfg
+
+    old_values = {}
+    for name, val in config.items():
+        var = getattr(cfg, name)
+        old_values[var] = var.get()
+        var.put(val)
+    try:
+        yield
+    finally:
+        for var, val in old_values.items():
+            var.put(val)
+
+
+__all__ = ["Parameter", "context"]

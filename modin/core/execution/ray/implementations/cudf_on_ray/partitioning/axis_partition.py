@@ -14,7 +14,8 @@
 """Module houses classes of axis partitions implemented using Ray and cuDF."""
 
 import cudf
-import ray
+
+from modin.core.execution.ray.common import RayWrapper
 
 from .partition import cuDFOnRayDataframePartition
 
@@ -74,7 +75,7 @@ class cuDFOnRayDataframeColumnPartition(cuDFOnRayDataframeAxisPartition):
         key = head_gpu_manager.reduce.remote(
             cudf_dataframe_object_ids, axis=self.axis, func=func
         )
-        key = ray.get(key)
+        key = RayWrapper.materialize(key)
         result = cuDFOnRayDataframePartition(gpu_manager=head_gpu_manager, key=key)
         return result
 
@@ -107,12 +108,12 @@ class cuDFOnRayDataframeRowPartition(cuDFOnRayDataframeAxisPartition):
         Notes
         -----
         Since we are using row partitions, we can bypass the Ray plasma
-        store during axis reduction functions.
+        store during axis reduce functions.
         """
         keys = [partition.get_key() for partition in self.partitions]
         gpu = self.partitions[0].get_gpu_manager()
 
         # FIXME: Method `gpu_manager.reduce_key_list` does not exist.
         key = gpu.reduce_key_list.remote(keys, func)
-        key = ray.get(key)
+        key = RayWrapper.materialize(key)
         return cuDFOnRayDataframePartition(gpu_manager=gpu, key=key)

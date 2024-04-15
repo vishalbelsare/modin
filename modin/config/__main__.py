@@ -19,21 +19,27 @@ Using `-export_path` option configs description can be exported to the external 
 provided with this flag.
 """
 
-from . import *  # noqa: F403, F401
-from .pubsub import Parameter
-import pandas
 import argparse
+from textwrap import dedent
+
+import pandas
+
+import modin.config as cfg
 
 
-def print_config_help():
+def print_config_help() -> None:
     """Print configs help messages."""
-    for objname in sorted(globals()):
-        obj = globals()[objname]
-        if isinstance(obj, type) and issubclass(obj, Parameter) and not obj.is_abstract:
-            print(f"{obj.get_help()}\n\tCurrent value: {obj.get()}")  # noqa: T001
+    for objname in sorted(cfg.__all__):
+        obj = getattr(cfg, objname)
+        if (
+            isinstance(obj, type)
+            and issubclass(obj, cfg.Parameter)
+            and not obj.is_abstract
+        ):
+            print(f"{obj.get_help()}\n\tCurrent value: {obj.get()}")  # noqa: T201
 
 
-def export_config_help(filename: str):
+def export_config_help(filename: str) -> None:
     """
     Export all configs help messages to the CSV file.
 
@@ -42,32 +48,43 @@ def export_config_help(filename: str):
     filename : str
         Name of the file to export configs data.
     """
-    configs = pandas.DataFrame(
+    configs_data = []
+    default_values = dict(
+        RayRedisPassword="random string",
+        CpuCount="multiprocessing.cpu_count()",
+        NPartitions="equals to MODIN_CPUS env",
+    )
+    for objname in sorted(cfg.__all__):
+        obj = getattr(cfg, objname)
+        if (
+            isinstance(obj, type)
+            and issubclass(obj, cfg.Parameter)
+            and not obj.is_abstract
+        ):
+            data = {
+                "Config Name": obj.__name__,
+                "Env. Variable Name": getattr(
+                    obj, "varname", "not backed by environment"
+                ),
+                "Default Value": default_values.get(obj.__name__, obj._get_default()),
+                # `Notes` `-` underlining can't be correctly parsed inside csv table by sphinx
+                "Description": dedent(obj.__doc__ or "").replace(
+                    "Notes\n-----", "Notes:\n"
+                ),
+                "Options": obj.choices,
+            }
+            configs_data.append(data)
+
+    pandas.DataFrame(
+        configs_data,
         columns=[
             "Config Name",
             "Env. Variable Name",
             "Default Value",
             "Description",
             "Options",
-        ]
-    )
-    for objname in sorted(globals()):
-        obj = globals()[objname]
-        if isinstance(obj, type) and issubclass(obj, Parameter) and not obj.is_abstract:
-            data = {
-                "Config Name": obj.__name__,
-                "Env. Variable Name": getattr(
-                    obj, "varname", "not backed by environment"
-                ),
-                "Default Value": obj._get_default()
-                if obj.__name__ != "RayRedisPassword"
-                else "random string",
-                "Description": obj.__doc__,
-                "Options": obj.choices,
-            }
-            configs = configs.append(data, ignore_index=True)
-
-    configs.to_csv(filename, index=False)
+        ],
+    ).to_csv(filename, index=False)
 
 
 if __name__ == "__main__":

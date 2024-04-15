@@ -13,77 +13,23 @@
 
 """Module houses class that implements ``GenericRayDataframePartitionManager`` using Ray."""
 
-import inspect
 import numpy as np
-import threading
+from pandas.core.dtypes.common import is_numeric_dtype
 
-from modin.config import ProgressBar
-from modin.core.execution.ray.generic.partitioning.partition_manager import (
+from modin.config import AsyncReadMode
+from modin.core.execution.modin_aqp import progress_bar_wrapper
+from modin.core.execution.ray.common import RayWrapper
+from modin.core.execution.ray.generic.partitioning import (
     GenericRayDataframePartitionManager,
 )
-from .axis_partition import (
+from modin.logging import get_logger
+from modin.utils import _inherit_docstrings
+
+from .partition import PandasOnRayDataframePartition
+from .virtual_partition import (
     PandasOnRayDataframeColumnPartition,
     PandasOnRayDataframeRowPartition,
 )
-from .partition import PandasOnRayDataframePartition
-from modin.core.execution.ray.generic.modin_aqp import call_progress_bar
-from modin.error_message import ErrorMessage
-import pandas
-
-import ray
-
-
-def progress_bar_wrapper(f):
-    """
-    Wrap computation function inside a progress bar.
-
-    Spawns another thread which displays a progress bar showing
-    estimated completion time.
-
-    Parameters
-    ----------
-    f : callable
-        The name of the function to be wrapped.
-
-    Returns
-    -------
-    callable
-        Decorated version of `f` which reports progress.
-    """
-    from functools import wraps
-
-    @wraps(f)
-    def magic(*args, **kwargs):
-        result_parts = f(*args, **kwargs)
-        if ProgressBar.get():
-            current_frame = inspect.currentframe()
-            function_name = None
-            while function_name != "<module>":
-                (
-                    filename,
-                    line_number,
-                    function_name,
-                    lines,
-                    index,
-                ) = inspect.getframeinfo(current_frame)
-                current_frame = current_frame.f_back
-            t = threading.Thread(
-                target=call_progress_bar,
-                args=(result_parts, line_number),
-            )
-            t.start()
-            # We need to know whether or not we are in a jupyter notebook
-            from IPython import get_ipython
-
-            try:
-                ipy_str = str(type(get_ipython()))
-                if "zmqshell" not in ipy_str:
-                    t.join()
-            except Exception:
-                pass
-        return result_parts
-
-    return magic
 
 
 class PandasOnRayDataframePartitionManager(GenericRayDataframePartitionManager):
@@ -93,385 +39,120 @@ class PandasOnRayDataframePartitionManager(GenericRayDataframePartitionManager):
     _partition_class = PandasOnRayDataframePartition
     _column_partitions_class = PandasOnRayDataframeColumnPartition
     _row_partition_class = PandasOnRayDataframeRowPartition
+    _execution_wrapper = RayWrapper
+    materialize_futures = RayWrapper.materialize
 
     @classmethod
-    def get_indices(cls, axis, partitions, index_func=None):
+    def wait_partitions(cls, partitions):
         """
-        Get the internal indices stored in the partitions.
+        Wait on the objects wrapped by `partitions` in parallel, without materializing them.
+
+        This method will block until all computations in the list have completed.
 
         Parameters
         ----------
-        axis : {0, 1}
-            Axis to extract the labels over.
         partitions : np.ndarray
             NumPy array with ``PandasDataframePartition``-s.
-        index_func : callable, default: None
-            The function to be used to extract the indices.
-
-        Returns
-        -------
-        pandas.Index
-            A ``pandas.Index`` object.
-
-        Notes
-        -----
-        These are the global indices of the object. This is mostly useful
-        when you have deleted rows/columns internally, but do not know
-        which ones were deleted.
         """
-        ErrorMessage.catch_bugs_and_request_email(not callable(index_func))
-        func = cls.preprocess_func(index_func)
-        if axis == 0:
-            # We grab the first column of blocks and extract the indices
-            new_idx = (
-                [idx.apply(func).oid for idx in partitions.T[0]]
-                if len(partitions.T)
-                else []
-            )
-        else:
-            new_idx = (
-                [idx.apply(func).oid for idx in partitions[0]]
-                if len(partitions)
-                else []
-            )
-        new_idx = ray.get(new_idx)
-        return new_idx[0].append(new_idx[1:]) if len(new_idx) else new_idx
+        RayWrapper.wait(
+            [block for partition in partitions for block in partition.list_of_blocks]
+        )
 
     @classmethod
-    def broadcast_apply(cls, axis, apply_func, left, right, other_name="r"):
-        """
-        Broadcast the `right` partitions to `left` and apply `apply_func` to selected indices.
+    @_inherit_docstrings(
+        GenericRayDataframePartitionManager.split_pandas_df_into_partitions
+    )
+    def split_pandas_df_into_partitions(
+        cls, df, row_chunksize, col_chunksize, update_bar
+    ):
+        # it was found out, that with the following condition it's more beneficial
+        # to use the distributed splitting, let's break them down:
+        #   1. The distributed splitting is used only when there's more than 6mln elements
+        #   in the `df`, as with fewer data it's better to use the sequential splitting
+        #   2. Only used with numerical data, as with other dtypes, putting the whole big
+        #   dataframe into the storage takes too much time.
+        #   3. The distributed splitting consumes more memory that the sequential one.
+        #   It was estimated that it requires ~2.5x of the dataframe size, for now there
+        #   was no good way found to automatically fall back to the sequential
+        #   implementation in case of not enough memory, so currently we're enabling
+        #   the distributed version only if 'AsyncReadMode' is set to True. Follow this
+        #   discussion for more info on why automatical dispatching is hard:
+        #   https://github.com/modin-project/modin/pull/6640#issuecomment-1759932664
+        enough_elements = (len(df) * len(df.columns)) > 6_000_000
+        all_numeric_types = all(is_numeric_dtype(dtype) for dtype in df.dtypes)
+        async_mode_on = AsyncReadMode.get()
 
-        Parameters
-        ----------
-        axis : {0, 1}
-            Axis to apply and broadcast over.
-        apply_func : callable
-            Function to apply.
-        left : np.ndarray
-            NumPy 2D array of left partitions.
-        right : np.ndarray
-            NumPy 2D array of right partitions.
-        other_name : str, default: "r"
-            Name of key-value argument for `apply_func` that
-            is used to pass `right` to `apply_func`.
+        distributed_splitting = enough_elements and all_numeric_types and async_mode_on
 
-        Returns
-        -------
-        np.ndarray
-            An array of partition objects.
-        """
+        log = get_logger()
 
-        def map_func(df, *others):
-            other = pandas.concat(others, axis=axis ^ 1)
-            return apply_func(df, **{other_name: other})
+        if not distributed_splitting:
+            log.info(
+                "Using sequential splitting in '.from_pandas()' because of some of the conditions are False: "
+                + f"{enough_elements=}; {all_numeric_types=}; {async_mode_on=}"
+            )
+            return super().split_pandas_df_into_partitions(
+                df, row_chunksize, col_chunksize, update_bar
+            )
 
-        map_func = cls.preprocess_func(map_func)
-        rt_axis_parts = cls.axis_partition(right, axis ^ 1)
-        return np.array(
+        log.info("Using distributed splitting in '.from_pandas()'")
+        put_func = cls._partition_class.put
+
+        def mask(part, row_loc, col_loc):
+            # 2D iloc works surprisingly slow, so doing this chained iloc calls:
+            # https://github.com/pandas-dev/pandas/issues/55202
+            return part.apply(lambda df: df.iloc[row_loc, :].iloc[:, col_loc])
+
+        main_part = put_func(df)
+        parts = [
             [
-                [
-                    part.apply(
-                        map_func,
-                        *(
-                            rt_axis_parts[col_idx].list_of_blocks
-                            if axis
-                            else rt_axis_parts[row_idx].list_of_blocks
-                        ),
-                    )
-                    for col_idx, part in enumerate(left[row_idx])
-                ]
-                for row_idx in range(len(left))
+                update_bar(
+                    mask(
+                        main_part,
+                        slice(i, i + row_chunksize),
+                        slice(j, j + col_chunksize),
+                    ),
+                )
+                for j in range(0, len(df.columns), col_chunksize)
             ]
-        )
+            for i in range(0, len(df), row_chunksize)
+        ]
+        return np.array(parts)
 
-    @classmethod
-    @progress_bar_wrapper
-    def map_partitions(cls, partitions, map_func):
-        """
-        Apply `map_func` to every partition in `partitions`.
 
-        Parameters
-        ----------
-        partitions : np.ndarray
-            A NumPy 2D array of partitions to perform operation on.
-        map_func : callable
-            Function to apply.
+def _make_wrapped_method(name: str):
+    """
+    Define new attribute that should work with progress bar.
 
-        Returns
-        -------
-        np.ndarray
-            A NumPy array of partitions.
-        """
-        return super(PandasOnRayDataframePartitionManager, cls).map_partitions(
-            partitions, map_func
-        )
+    Parameters
+    ----------
+    name : str
+        Name of `GenericRayDataframePartitionManager` attribute that should be reused.
 
-    @classmethod
-    @progress_bar_wrapper
-    def lazy_map_partitions(cls, partitions, map_func):
-        """
-        Apply `map_func` to every partition in `partitions` *lazily*.
+    Notes
+    -----
+    - `classmethod` decorator shouldn't be applied twice, so we refer to `__func__` attribute.
+    - New attribute is defined for `PandasOnRayDataframePartitionManager`.
+    """
+    setattr(
+        PandasOnRayDataframePartitionManager,
+        name,
+        classmethod(
+            progress_bar_wrapper(
+                getattr(GenericRayDataframePartitionManager, name).__func__
+            )
+        ),
+    )
 
-        Parameters
-        ----------
-        partitions : np.ndarray
-            A NumPy 2D array of partitions to perform operation on.
-        map_func : callable
-            Function to apply.
 
-        Returns
-        -------
-        np.ndarray
-            A NumPy array of partitions.
-        """
-        return super(PandasOnRayDataframePartitionManager, cls).lazy_map_partitions(
-            partitions, map_func
-        )
-
-    @classmethod
-    @progress_bar_wrapper
-    def map_axis_partitions(
-        cls,
-        axis,
-        partitions,
-        map_func,
-        keep_partitioning=False,
-        lengths=None,
-        enumerate_partitions=False,
-        **kwargs,
-    ):
-        """
-        Apply `map_func` to every partition in `partitions` along given `axis`.
-
-        Parameters
-        ----------
-        axis : {0, 1}
-            Axis to perform the map across (0 - index, 1 - columns).
-        partitions : np.ndarray
-            A NumPy 2D array of partitions to perform operation on.
-        map_func : callable
-            Function to apply.
-        keep_partitioning : bool, default: False
-            Whether to keep partitioning for Modin Frame.
-            Setting it to True prevents data shuffling between partitions.
-        lengths : list of ints, default: None
-            List of lengths to shuffle the object.
-        enumerate_partitions : bool, default: False
-            Whether or not to pass partition index into `map_func`.
-            Note that `map_func` must be able to accept `partition_idx` kwarg.
-        **kwargs : dict
-            Additional options that could be used by different engines.
-
-        Returns
-        -------
-        np.ndarray
-            A NumPy array of new partitions for Modin Frame.
-
-        Notes
-        -----
-        This method should be used in the case when `map_func` relies on
-        some global information about the axis.
-        """
-        return super(PandasOnRayDataframePartitionManager, cls).map_axis_partitions(
-            axis,
-            partitions,
-            map_func,
-            keep_partitioning,
-            lengths,
-            enumerate_partitions,
-            **kwargs,
-        )
-
-    @classmethod
-    @progress_bar_wrapper
-    def _apply_func_to_list_of_partitions(cls, func, partitions, **kwargs):
-        """
-        Apply a `func` to a list of remote `partitions`.
-
-        Parameters
-        ----------
-        func : callable
-            The func to apply.
-        partitions : np.ndarray
-            The partitions to which the `func` will apply.
-        **kwargs : dict
-            Keyword arguments.
-
-        Returns
-        -------
-        list
-            A list of ``RayFramePartition`` objects.
-
-        Notes
-        -----
-        This preprocesses the `func` first before applying it to the partitions.
-        """
-        return super(
-            PandasOnRayDataframePartitionManager, cls
-        )._apply_func_to_list_of_partitions(func, partitions, **kwargs)
-
-    @classmethod
-    @progress_bar_wrapper
-    def apply_func_to_select_indices(
-        cls, axis, partitions, func, indices, keep_remaining=False
-    ):
-        """
-        Apply a `func` to select `indices` of `partitions`.
-
-        Parameters
-        ----------
-        axis : {0, 1}
-            Axis to apply the `func` over.
-        partitions : np.ndarray
-            The partitions to which the `func` will apply.
-        func : callable
-            The function to apply to these indices of partitions.
-        indices : dict
-            The indices to apply the function to.
-        keep_remaining : bool, default: False
-            Whether or not to keep the other partitions. Some operations
-            may want to drop the remaining partitions and keep
-            only the results.
-
-        Returns
-        -------
-        np.ndarray
-            A NumPy array with partitions.
-
-        Notes
-        -----
-        Your internal function must take a kwarg `internal_indices` for
-        this to work correctly. This prevents information leakage of the
-        internal index to the external representation.
-        """
-        return super(
-            PandasOnRayDataframePartitionManager, cls
-        ).apply_func_to_select_indices(
-            axis, partitions, func, indices, keep_remaining=keep_remaining
-        )
-
-    @classmethod
-    @progress_bar_wrapper
-    def apply_func_to_select_indices_along_full_axis(
-        cls, axis, partitions, func, indices, keep_remaining=False
-    ):
-        """
-        Apply a `func` to a select subset of full columns/rows.
-
-        Parameters
-        ----------
-        axis : {0, 1}
-            The axis to apply the `func` over.
-        partitions : np.ndarray
-            The partitions to which the `func` will apply.
-        func : callable
-            The function to apply.
-        indices : list-like
-            The global indices to apply the func to.
-        keep_remaining : bool, default: False
-            Whether or not to keep the other partitions.
-            Some operations may want to drop the remaining partitions and
-            keep only the results.
-
-        Returns
-        -------
-        np.ndarray
-            A NumPy array with partitions.
-
-        Notes
-        -----
-        This should be used when you need to apply a function that relies
-        on some global information for the entire column/row, but only need
-        to apply a function to a subset.
-        For your func to operate directly on the indices provided,
-        it must use `internal_indices` as a keyword argument.
-        """
-        return super(
-            PandasOnRayDataframePartitionManager, cls
-        ).apply_func_to_select_indices_along_full_axis(
-            axis, partitions, func, indices, keep_remaining
-        )
-
-    @classmethod
-    @progress_bar_wrapper
-    def apply_func_to_indices_both_axis(
-        cls,
-        partitions,
-        func,
-        row_partitions_list,
-        col_partitions_list,
-        item_to_distribute=None,
-        row_lengths=None,
-        col_widths=None,
-    ):
-        """
-        Apply a function along both axes.
-
-        Parameters
-        ----------
-        partitions : np.ndarray
-            The partitions to which the `func` will apply.
-        func : callable
-            The function to apply.
-        row_partitions_list : list
-            List of row partitions.
-        col_partitions_list : list
-            List of column partitions.
-        item_to_distribute : item, optional
-            The item to split up so it can be applied over both axes.
-        row_lengths : list of ints, optional
-            Lengths of partitions for every row. If not specified this information
-            is extracted from partitions itself.
-        col_widths : list of ints, optional
-            Widths of partitions for every column. If not specified this information
-            is extracted from partitions itself.
-
-        Returns
-        -------
-        np.ndarray
-            A NumPy array with partitions.
-
-        Notes
-        -----
-        For your func to operate directly on the indices provided,
-        it must use ``row_internal_indices`` and ``col_internal_indices`` as keyword
-        arguments.
-        """
-        return super(
-            PandasOnRayDataframePartitionManager, cls
-        ).apply_func_to_indices_both_axis(
-            partitions,
-            func,
-            row_partitions_list,
-            col_partitions_list,
-            item_to_distribute,
-            row_lengths,
-            col_widths,
-        )
-
-    @classmethod
-    @progress_bar_wrapper
-    def binary_operation(cls, axis, left, func, right):
-        """
-        Apply a function that requires partitions of two ``PandasOnRayDataframe`` objects.
-
-        Parameters
-        ----------
-        axis : {0, 1}
-            The axis to apply the function over (0 - rows, 1 - columns).
-        left : np.ndarray
-            The partitions of left ``PandasOnRayDataframe``.
-        func : callable
-            The function to apply.
-        right : np.ndarray
-            The partitions of right ``PandasOnRayDataframe``.
-
-        Returns
-        -------
-        np.ndarray
-            A NumPy array with new partitions.
-        """
-        return super(PandasOnRayDataframePartitionManager, cls).binary_operation(
-            axis, left, func, right
-        )
+for method in (
+    "map_partitions",
+    "lazy_map_partitions",
+    "map_axis_partitions",
+    "_apply_func_to_list_of_partitions",
+    "apply_func_to_select_indices",
+    "apply_func_to_select_indices_along_full_axis",
+    "apply_func_to_indices_both_axis",
+    "n_ary_operation",
+):
+    _make_wrapped_method(method)

@@ -72,7 +72,7 @@ you should reopen your terminal to find "(base)" next to your prompt: ![](conda_
 
 1. Try a unit test:
     ```
-    pytest modin/pandas/test/test_concat.py
+    pytest modin/tests/pandas/test_concat.py
     ```
 
 1. [Add a GPG key](https://docs.github.com/en/authentication/managing-commit-signature-verification/adding-a-new-gpg-key-to-your-github-account ) to your Modin account. Your commits need to be signed with a GPG key. For mac, you can use [Mac GPG](https://gpgtools.org/).
@@ -87,5 +87,5 @@ you should reopen your terminal to find "(base)" next to your prompt: ![](conda_
         1. Again in settings, search for "format on save" and enable the "Editor: Format on Save" option.
     2. Add a pre-commit hook:
         1. In your modin repository, copy [this pre-commit file](pre-commit) to `.git/hooks/pre-commit`
-        1. Every time you try to commit, git will run flake8 and abort the commit if it fails. This lets you make sure your commits passes flake8 before you push to GitHub.
+        1. Every time you try to commit, git will try to run flake8 and mypy, and abort the commit if either one fails. This lets you make sure your commits pass these tests before you push to GitHub.
         1. To bypass the pre-commit hook (e.g. if you don't want to create a pull request, or you already know your code will pass the tests), commit with the flag `--no-verify`.

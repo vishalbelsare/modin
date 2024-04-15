@@ -13,10 +13,10 @@
 
 """The module defines interface for a partition with pandas storage format and Python engine."""
 
-import pandas
+import warnings
 
-from modin.core.storage_formats.pandas.utils import length_fn_pandas, width_fn_pandas
 from modin.core.dataframe.pandas.partitioning.partition import PandasDataframePartition
+from modin.core.execution.python.common import PythonWrapper
 
 
 class PandasOnPythonDataframePartition(PandasDataframePartition):
@@ -44,8 +44,13 @@ class PandasOnPythonDataframePartition(PandasDataframePartition):
     subclasses. There is no logic for updating in-place.
     """
 
+    execution_wrapper = PythonWrapper
+
     def __init__(self, data, length=None, width=None, call_queue=None):
-        self.data = data
+        super().__init__()
+        if hasattr(data, "copy"):
+            data = data.copy()
+        self._data = data
         if call_queue is None:
             call_queue = []
         self.call_queue = call_queue
@@ -66,7 +71,7 @@ class PandasOnPythonDataframePartition(PandasDataframePartition):
         Since this object is a simple wrapper, just return the copy of data.
         """
         self.drain_call_queue()
-        return self.data.copy()
+        return self._data.copy() if hasattr(self._data, "copy") else self._data
 
     def apply(self, func, *args, **kwargs):
         """
@@ -103,39 +108,19 @@ class PandasOnPythonDataframePartition(PandasDataframePartition):
             pandas.DataFrame or pandas.Series
             """
             result = data.copy()
-            for func, args, kwargs in call_queue:
+            for func, f_args, f_kwargs in call_queue:
                 try:
-                    result = func(result, *args, **kwargs)
-                except Exception as e:
+                    result = func(result, *f_args, **f_kwargs)
+                except Exception as err:
                     self.call_queue = []
-                    raise e
+                    raise err
             return result
 
-        self.data = call_queue_closure(self.data, self.call_queue)
+        self._data = call_queue_closure(self._data, self.call_queue)
         self.call_queue = []
-        return PandasOnPythonDataframePartition(func(self.data.copy(), *args, **kwargs))
-
-    def add_to_apply_calls(self, func, *args, **kwargs):
-        """
-        Add a function to the call queue.
-
-        Parameters
-        ----------
-        func : callable
-            Function to be added to the call queue.
-        *args : iterable
-            Additional positional arguments to be passed in `func`.
-        **kwargs : dict
-            Additional keyword arguments to be passed in `func`.
-
-        Returns
-        -------
-        PandasOnPythonDataframePartition
-            New ``PandasOnPythonDataframePartition`` object with extended call queue.
-        """
-        return PandasOnPythonDataframePartition(
-            self.data.copy(), call_queue=self.call_queue + [(func, args, kwargs)]
-        )
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=FutureWarning)
+            return self.__constructor__(func(self._data.copy(), *args, **kwargs))
 
     def drain_call_queue(self):
         """Execute all operations stored in the call queue on the object wrapped by this partition."""
@@ -150,38 +135,6 @@ class PandasOnPythonDataframePartition(PandasDataframePartition):
         Internally will be done by flushing the call queue.
         """
         self.drain_call_queue()
-
-    def to_pandas(self):
-        """
-        Return copy of the ``pandas.Dataframe`` stored in this partition.
-
-        Returns
-        -------
-        pandas.DataFrame
-
-        Notes
-        -----
-        Equivalent to ``get`` method for this class.
-        """
-        dataframe = self.get()
-        assert type(dataframe) is pandas.DataFrame or type(dataframe) is pandas.Series
-
-        return dataframe
-
-    def to_numpy(self, **kwargs):
-        """
-        Return NumPy array representation of ``pandas.DataFrame`` stored in this partition.
-
-        Parameters
-        ----------
-        **kwargs : dict
-            Keyword arguments to pass into `pandas.DataFrame.to_numpy` function.
-
-        Returns
-        -------
-        np.ndarray
-        """
-        return self.apply(lambda df, **kwargs: df.to_numpy(**kwargs)).get()
 
     @classmethod
     def put(cls, obj):
@@ -198,7 +151,7 @@ class PandasOnPythonDataframePartition(PandasDataframePartition):
         PandasOnPythonDataframePartition
             New ``PandasOnPythonDataframePartition`` object.
         """
-        return cls(obj)
+        return cls(obj.copy(), len(obj.index), len(obj.columns))
 
     @classmethod
     def preprocess_func(cls, func):
@@ -221,68 +174,3 @@ class PandasOnPythonDataframePartition(PandasDataframePartition):
         `func` will be returned.
         """
         return func
-
-    @classmethod
-    def _length_extraction_fn(cls):
-        """
-        Return the function that computes the length of the object wrapped by this partition.
-
-        Returns
-        -------
-        callable
-            The function that computes the length of the object wrapped by this partition.
-        """
-        return length_fn_pandas
-
-    @classmethod
-    def _width_extraction_fn(cls):
-        """
-        Return the function that computes the width of the object wrapped by this partition.
-
-        Returns
-        -------
-        callable
-            The function that computes the width of the object wrapped by this partition.
-        """
-        return width_fn_pandas
-
-    _length_cache = None
-    _width_cache = None
-
-    def length(self):
-        """
-        Get the length of the object wrapped by this partition.
-
-        Returns
-        -------
-        int
-            The length of the object.
-        """
-        if self._length_cache is None:
-            self._length_cache = self.apply(self._length_extraction_fn()).data
-        return self._length_cache
-
-    def width(self):
-        """
-        Get the width of the object wrapped by the partition.
-
-        Returns
-        -------
-        int
-            The width of the object.
-        """
-        if self._width_cache is None:
-            self._width_cache = self.apply(self._width_extraction_fn()).data
-        return self._width_cache
-
-    @classmethod
-    def empty(cls):
-        """
-        Create a new partition that wraps an empty pandas DataFrame.
-
-        Returns
-        -------
-        PandasOnPythonDataframePartition
-            New ``PandasOnPythonDataframePartition`` object wrapping empty pandas DataFrame.
-        """
-        return cls(pandas.DataFrame())

@@ -10,45 +10,65 @@
 # the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF
 # ANY KIND, either express or implied. See the License for the specific language
 # governing permissions and limitations under the License.
-
 """Implement DataFrame/Series public API as pandas does."""
+from __future__ import annotations
+
+import pickle as pkl
+import re
+import warnings
+from typing import TYPE_CHECKING, Any, Hashable, Literal, Optional, Sequence, Union
 
 import numpy as np
-from numpy import nan
 import pandas
-from pandas.compat import numpy as numpy_compat
-from pandas.core.common import count_not_none, pipe
-from pandas.core.dtypes.common import (
-    is_list_like,
-    is_dict_like,
-    is_numeric_dtype,
-    is_datetime_or_timedelta_dtype,
-    is_dtype_equal,
-    is_object_dtype,
-)
-import pandas.core.window.rolling
-import pandas.core.resample
 import pandas.core.generic
-from pandas.core.indexing import convert_to_index_sliceable
-from pandas.util._validators import validate_bool_kwarg, validate_percentile
-from pandas._libs.lib import no_default
+import pandas.core.resample
+import pandas.core.window.rolling
+from pandas._libs import lib
+from pandas._libs.tslibs import to_offset
 from pandas._typing import (
+    Axis,
     CompressionOptions,
+    DtypeBackend,
     IndexKeyFunc,
-    FilePathOrBuffer,
+    IndexLabel,
+    Level,
+    RandomState,
     StorageOptions,
     TimedeltaConvertibleTypes,
     TimestampConvertibleTypes,
+    npt,
 )
-import re
-from typing import Optional, Union, Sequence, Hashable
-import warnings
-import pickle as pkl
+from pandas.compat import numpy as numpy_compat
+from pandas.core.common import count_not_none, pipe
+from pandas.core.dtypes.common import (
+    is_bool_dtype,
+    is_dict_like,
+    is_dtype_equal,
+    is_integer,
+    is_integer_dtype,
+    is_list_like,
+    is_numeric_dtype,
+    is_object_dtype,
+)
+from pandas.core.indexes.api import ensure_index
+from pandas.core.methods.describe import _refine_percentiles
+from pandas.util._validators import (
+    validate_ascending,
+    validate_bool_kwarg,
+    validate_percentile,
+)
 
-from modin.utils import try_cast_to_pandas, _inherit_docstrings
+from modin import pandas as pd
 from modin.error_message import ErrorMessage
+from modin.logging import ClassLogger, disable_logging
+from modin.pandas.accessor import CachedAccessor, ModinAPI
 from modin.pandas.utils import is_scalar
-from modin.config import IsExperimental
+from modin.utils import _inherit_docstrings, expanduser_path_arg, try_cast_to_pandas
+
+from .utils import _doc_binary_op, is_full_grab_slice
+
+if TYPE_CHECKING:
+    from modin.core.storage_formats import BaseQueryCompiler
 
 # Similar to pandas, sentinel value to use as kwarg in place of None when None has
 # special meaning and needs to be distinguished from a user explicitly passing None.
@@ -56,7 +76,7 @@ sentinel = object()
 
 # Do not lookup certain attributes in columns or index, as they're used for some
 # special purposes, like serving remote context
-_ATTRS_NO_LOOKUP = {"____id_pack__", "__name__"}
+_ATTRS_NO_LOOKUP = {"__name__", "_cache"}
 
 _DEFAULT_BEHAVIOUR = {
     "__init__",
@@ -71,15 +91,18 @@ _DEFAULT_BEHAVIOUR = {
     "name",
     "dtypes",
     "dtype",
+    "groupby",
     "_get_name",
     "_set_name",
     "_default_to_pandas",
     "_query_compiler",
     "_to_pandas",
+    "_repartition",
     "_build_repr_df",
     "_reduce_dimension",
     "__repr__",
     "__len__",
+    "__constructor__",
     "_create_or_update_from_compiler",
     "_update_inplace",
     # for persistance support;
@@ -87,11 +110,62 @@ _DEFAULT_BEHAVIOUR = {
     "_inflate_light",
     "_inflate_full",
     "__reduce__",
+    "__reduce_ex__",
+    "_init",
 } | _ATTRS_NO_LOOKUP
 
+_doc_binary_op_kwargs = {"returns": "BasePandasDataset", "left": "BasePandasDataset"}
 
-@_inherit_docstrings(pandas.DataFrame, apilink="pandas.DataFrame")
-class BasePandasDataset(object):
+
+def _get_repr_axis_label_indexer(labels, num_for_repr):
+    """
+    Get the indexer for the given axis labels to be used for the repr.
+
+    Parameters
+    ----------
+    labels : pandas.Index
+        The axis labels.
+    num_for_repr : int
+        The number of elements to display.
+
+    Returns
+    -------
+    slice or list
+        The indexer to use for the repr.
+    """
+    if len(labels) <= num_for_repr:
+        return slice(None)
+    # At this point, the entire axis has len(labels) elements, and num_for_repr <
+    # len(labels). We want to select a pandas subframe containing elements such that:
+    #   - the repr of the pandas subframe will be the same as the repr of the entire
+    #     frame.
+    #   - the pandas repr will not be able to show all the elements and will put an
+    #      ellipsis in the middle
+    #
+    # We accomplish this by selecting some elements from the front and some from the
+    # back, with the front having at most 1 element more than the back. The total
+    # number of elements will be num_for_repr + 1.
+
+    if num_for_repr % 2 == 0:
+        # If num_for_repr is even, take an extra element from the front.
+        # The total number of elements we are selecting is (num_for_repr // 2) * 2 + 1
+        # = num_for_repr + 1
+        front_repr_num = num_for_repr // 2 + 1
+        back_repr_num = num_for_repr // 2
+    else:
+        # If num_for_repr is odd, take an extra element from both the front and the
+        # back. The total number of elements we are selecting is
+        # (num_for_repr // 2) * 2 + 1 + 1 = num_for_repr + 1
+        front_repr_num = num_for_repr // 2 + 1
+        back_repr_num = num_for_repr // 2 + 1
+    all_positions = range(len(labels))
+    return list(all_positions[:front_repr_num]) + (
+        [] if back_repr_num == 0 else list(all_positions[-back_repr_num:])
+    )
+
+
+@_inherit_docstrings(pandas.DataFrame, apilink=["pandas.DataFrame", "pandas.Series"])
+class BasePandasDataset(ClassLogger):
     """
     Implement most of the common code that exists in DataFrame/Series.
 
@@ -103,10 +177,41 @@ class BasePandasDataset(object):
     # Pandas class that we pretend to be; usually it has the same name as our class
     # but lives in "pandas" namespace.
     _pandas_class = pandas.core.generic.NDFrame
+    _query_compiler: BaseQueryCompiler
 
-    # Siblings are other objects that share the same query compiler. We use this list
-    # to update inplace when there is a shallow copy.
-    _siblings = []
+    @pandas.util.cache_readonly
+    def _is_dataframe(self) -> bool:
+        """
+        Tell whether this is a dataframe.
+
+        Ideally, other methods of BasePandasDataset shouldn't care whether this
+        is a dataframe or a series, but sometimes we need to know. This method
+        is better than hasattr(self, "columns"), which for series will call
+        self.__getattr__("columns"), which requires materializing the index.
+
+        Returns
+        -------
+        bool : Whether this is a dataframe.
+        """
+        return issubclass(self._pandas_class, pandas.DataFrame)
+
+    def _create_or_update_from_compiler(self, new_query_compiler, inplace=False):
+        """
+        Return or update a ``DataFrame`` or ``Series`` with given `new_query_compiler`.
+
+        Parameters
+        ----------
+        new_query_compiler : PandasQueryCompiler
+            QueryCompiler to use to manage the data.
+        inplace : bool, default: False
+            Whether or not to perform update or creation inplace.
+
+        Returns
+        -------
+        DataFrame, Series or None
+            None if update was done, ``DataFrame`` or ``Series`` otherwise.
+        """
+        raise NotImplementedError()
 
     def _add_sibling(self, sibling):
         """
@@ -148,50 +253,14 @@ class BasePandasDataset(object):
             A pandas dataset with `num_rows` or fewer rows and `num_cols` or fewer columns.
         """
         # Fast track for empty dataframe.
-        if len(self.index) == 0 or (
-            hasattr(self, "columns") and len(self.columns) == 0
-        ):
+        if len(self.index) == 0 or (self._is_dataframe and len(self.columns) == 0):
             return pandas.DataFrame(
                 index=self.index,
-                columns=self.columns if hasattr(self, "columns") else None,
+                columns=self.columns if self._is_dataframe else None,
             )
-        if len(self.index) <= num_rows:
-            row_indexer = slice(None)
-        else:
-            # Add one here so that pandas automatically adds the dots
-            # It turns out to be faster to extract 2 extra rows and columns than to
-            # build the dots ourselves.
-            num_rows_for_head = num_rows // 2 + 1
-            num_rows_for_tail = (
-                num_rows_for_head
-                if len(self.index) > num_rows
-                else len(self.index) - num_rows_for_head
-                if len(self.index) - num_rows_for_head >= 0
-                else None
-            )
-            row_indexer = list(range(len(self.index))[:num_rows_for_head]) + (
-                list(range(len(self.index))[-num_rows_for_tail:])
-                if num_rows_for_tail is not None
-                else []
-            )
-        if hasattr(self, "columns"):
-            if len(self.columns) <= num_cols:
-                col_indexer = slice(None)
-            else:
-                num_cols_for_front = num_cols // 2 + 1
-                num_cols_for_back = (
-                    num_cols_for_front
-                    if len(self.columns) > num_cols
-                    else len(self.columns) - num_cols_for_front
-                    if len(self.columns) - num_cols_for_front >= 0
-                    else None
-                )
-                col_indexer = list(range(len(self.columns))[:num_cols_for_front]) + (
-                    list(range(len(self.columns))[-num_cols_for_back:])
-                    if num_cols_for_back is not None
-                    else []
-                )
-            indexer = row_indexer, col_indexer
+        row_indexer = _get_repr_axis_label_indexer(self.index, num_rows)
+        if self._is_dataframe:
+            indexer = row_indexer, _get_repr_axis_label_indexer(self.columns, num_cols)
         else:
             indexer = row_indexer
         return self.iloc[indexer]._query_compiler.to_pandas()
@@ -215,10 +284,7 @@ class BasePandasDataset(object):
         self,
         other,
         axis,
-        numeric_only=False,
-        numeric_or_time_only=False,
-        numeric_or_object_only=False,
-        comparison_dtypes_only=False,
+        dtype_check=False,
         compare_index=False,
     ):
         """
@@ -232,14 +298,8 @@ class BasePandasDataset(object):
             Specifies axis along which to do validation. When `1` or `None`
             is specified, validation is done along `index`, if `0` is specified
             validation is done along `columns` of `other` frame.
-        numeric_only : bool, default: False
-            Validates that both frames have only numeric dtypes.
-        numeric_or_time_only : bool, default: False
-            Validates that both frames have either numeric or time dtypes.
-        numeric_or_object_only : bool, default: False
-            Validates that both frames have either numeric or object dtypes.
-        comparison_dtypes_only : bool, default: False
-            Validates that both frames have either numeric or time or equal dtypes.
+        dtype_check : bool, default: False
+            Validates that both frames have compatible dtypes.
         compare_index : bool, default: False
             Compare Index if True.
 
@@ -256,83 +316,72 @@ class BasePandasDataset(object):
         TypeError
             If any validation checks fail.
         """
-        # We skip dtype checking if the other is a scalar.
-        if is_scalar(other):
+        if isinstance(other, BasePandasDataset):
+            return other._query_compiler
+        if not is_list_like(other):
+            # We skip dtype checking if the other is a scalar. Note that pandas
+            # is_scalar can be misleading as it is False for almost all objects,
+            # even when those objects should be treated as scalars. See e.g.
+            # https://github.com/modin-project/modin/issues/5236. Therefore, we
+            # detect scalars by checking that `other` is neither a list-like nor
+            # another BasePandasDataset.
             return other
         axis = self._get_axis_number(axis) if axis is not None else 1
         result = other
-        if isinstance(other, BasePandasDataset):
-            return other._query_compiler
-        elif is_list_like(other):
-            if axis == 0:
-                if len(other) != len(self._query_compiler.index):
-                    raise ValueError(
-                        "Unable to coerce to Series, length must be {0}: "
-                        "given {1}".format(len(self._query_compiler.index), len(other))
-                    )
-            else:
-                if len(other) != len(self._query_compiler.columns):
-                    raise ValueError(
-                        "Unable to coerce to Series, length must be {0}: "
-                        "given {1}".format(
-                            len(self._query_compiler.columns), len(other)
-                        )
-                    )
-            if hasattr(other, "dtype"):
-                other_dtypes = [other.dtype] * len(other)
-            else:
-                other_dtypes = [type(x) for x in other]
-        else:
-            other_dtypes = [
-                type(other)
-                for _ in range(
-                    len(self._query_compiler.index)
-                    if axis
-                    else len(self._query_compiler.columns)
+        if axis == 0:
+            if len(other) != len(self._query_compiler.index):
+                raise ValueError(
+                    f"Unable to coerce to Series, length must be {len(self._query_compiler.index)}: "
+                    + f"given {len(other)}"
                 )
+        else:
+            if len(other) != len(self._query_compiler.columns):
+                raise ValueError(
+                    f"Unable to coerce to Series, length must be {len(self._query_compiler.columns)}: "
+                    + f"given {len(other)}"
+                )
+        if hasattr(other, "dtype"):
+            other_dtypes = [other.dtype] * len(other)
+        elif is_dict_like(other):
+            other_dtypes = [
+                type(other[label])
+                for label in self._get_axis(axis)
+                # The binary operation is applied for intersection of axis labels
+                # and dictionary keys. So filtering out extra keys.
+                if label in other
             ]
+        else:
+            other_dtypes = [type(x) for x in other]
         if compare_index:
             if not self.index.equals(other.index):
                 raise TypeError("Cannot perform operation with non-equal index")
         # Do dtype checking.
-        if numeric_only:
-            if not all(
-                is_numeric_dtype(self_dtype) and is_numeric_dtype(other_dtype)
-                for self_dtype, other_dtype in zip(self._get_dtypes(), other_dtypes)
-            ):
-                raise TypeError("Cannot do operation on non-numeric dtypes")
-        elif numeric_or_object_only:
+        if dtype_check:
+            self_dtypes = self._get_dtypes()
+            if is_dict_like(other):
+                # The binary operation is applied for the intersection of axis labels
+                # and dictionary keys. So filtering `self_dtypes` to match the `other`
+                # dictionary.
+                self_dtypes = [
+                    dtype
+                    for label, dtype in zip(self._get_axis(axis), self._get_dtypes())
+                    if label in other
+                ]
+
+            # TODO(https://github.com/modin-project/modin/issues/5239):
+            # this spuriously rejects other that is a list including some
+            # custom type that can be added to self's elements.
             if not all(
                 (is_numeric_dtype(self_dtype) and is_numeric_dtype(other_dtype))
                 or (is_object_dtype(self_dtype) and is_object_dtype(other_dtype))
-                for self_dtype, other_dtype in zip(self._get_dtypes(), other_dtypes)
-            ):
-                raise TypeError("Cannot do operation non-numeric dtypes")
-        elif comparison_dtypes_only:
-            if not all(
-                (is_numeric_dtype(self_dtype) and is_numeric_dtype(other_dtype))
                 or (
-                    is_datetime_or_timedelta_dtype(self_dtype)
-                    and is_datetime_or_timedelta_dtype(other_dtype)
+                    lib.is_np_dtype(self_dtype, "mM")
+                    and lib.is_np_dtype(self_dtype, "mM")
                 )
                 or is_dtype_equal(self_dtype, other_dtype)
-                for self_dtype, other_dtype in zip(self._get_dtypes(), other_dtypes)
+                for self_dtype, other_dtype in zip(self_dtypes, other_dtypes)
             ):
-                raise TypeError(
-                    "Cannot do operation non-numeric objects with numeric objects"
-                )
-        elif numeric_or_time_only:
-            if not all(
-                (is_numeric_dtype(self_dtype) and is_numeric_dtype(other_dtype))
-                or (
-                    is_datetime_or_timedelta_dtype(self_dtype)
-                    and is_datetime_or_timedelta_dtype(other_dtype)
-                )
-                for self_dtype, other_dtype in zip(self._get_dtypes(), other_dtypes)
-            ):
-                raise TypeError(
-                    "Cannot do operation non-numeric objects with numeric objects"
-                )
+                raise TypeError("Cannot do operation with improper dtypes")
         return result
 
     def _validate_function(self, func, on_invalid=None):
@@ -359,7 +408,7 @@ class BasePandasDataset(object):
             [self._validate_function(fn, on_invalid) for fn in func.values()]
             return
             # We also could validate this, but it may be quite expensive for lazy-frames
-            # if not all(idx in self.axes[axis] for idx in func.keys()):
+            # if not all(idx in self._get_axis(axis) for idx in func.keys()):
             #     error_raiser("Invalid dict keys", KeyError)
 
         if not is_list_like(func):
@@ -369,13 +418,13 @@ class BasePandasDataset(object):
             if isinstance(fn, str):
                 if not (hasattr(self, fn) or hasattr(np, fn)):
                     on_invalid(
-                        f"{fn} is not valid function for {type(self)} object.",
+                        f"'{fn}' is not a valid function for '{type(self).__name__}' object",
                         AttributeError,
                     )
             elif not callable(fn):
                 on_invalid(
                     f"One of the passed functions has an invalid type: {type(fn)}: {fn}, "
-                    "only callable or string is acceptable.",
+                    + "only callable or string is acceptable.",
                     TypeError,
                 )
 
@@ -411,7 +460,7 @@ class BasePandasDataset(object):
             return self._default_to_pandas(
                 getattr(self._pandas_class, op), other, **kwargs
             )
-        other = self._validate_other(other, axis, numeric_or_object_only=True)
+        other = self._validate_other(other, axis, dtype_check=True)
         exclude_list = [
             "__add__",
             "__radd__",
@@ -427,7 +476,7 @@ class BasePandasDataset(object):
         new_query_compiler = getattr(self._query_compiler, op)(other, **kwargs)
         return self._create_or_update_from_compiler(new_query_compiler)
 
-    def _default_to_pandas(self, op, *args, **kwargs):
+    def _default_to_pandas(self, op, *args, reason: str = None, **kwargs):
         """
         Convert dataset to pandas type and call a pandas function on it.
 
@@ -437,6 +486,7 @@ class BasePandasDataset(object):
             Name of pandas function.
         *args : list
             Additional positional arguments to be passed to `op`.
+        reason : str, optional
         **kwargs : dict
             Additional keywords arguments to be passed to `op`.
 
@@ -451,34 +501,33 @@ class BasePandasDataset(object):
                 type(self).__name__,
                 op if isinstance(op, str) else op.__name__,
                 empty_self_str,
-            )
+            ),
+            reason=reason,
         )
 
         args = try_cast_to_pandas(args)
         kwargs = try_cast_to_pandas(kwargs)
         pandas_obj = self._to_pandas()
-        if callable(op):
-            result = op(pandas_obj, *args, **kwargs)
-        elif isinstance(op, str):
-            # The inner `getattr` is ensuring that we are treating this object (whether
-            # it is a DataFrame, Series, etc.) as a pandas object. The outer `getattr`
-            # will get the operation (`op`) from the pandas version of the class and run
-            # it on the object after we have converted it to pandas.
-            result = getattr(self._pandas_class, op)(pandas_obj, *args, **kwargs)
-        else:
-            ErrorMessage.catch_bugs_and_request_email(
-                failure_condition=True,
-                extra_log="{} is an unsupported operation".format(op),
-            )
-        # SparseDataFrames cannot be serialized by arrow and cause problems for Modin.
-        # For now we will use pandas.
-        if isinstance(result, type(self)) and not isinstance(
-            result, (pandas.SparseDataFrame, pandas.SparseSeries)
-        ):
-            return self._create_or_update_from_compiler(
-                result, inplace=kwargs.get("inplace", False)
-            )
-        elif isinstance(result, pandas.DataFrame):
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=FutureWarning)
+            if callable(op):
+                result = op(pandas_obj, *args, **kwargs)
+            elif isinstance(op, str):
+                # The inner `getattr` is ensuring that we are treating this object (whether
+                # it is a DataFrame, Series, etc.) as a pandas object. The outer `getattr`
+                # will get the operation (`op`) from the pandas version of the class and run
+                # it on the object after we have converted it to pandas.
+                attr = getattr(self._pandas_class, op)
+                if isinstance(attr, property):
+                    result = getattr(pandas_obj, op)
+                else:
+                    result = attr(pandas_obj, *args, **kwargs)
+            else:
+                ErrorMessage.catch_bugs_and_request_email(
+                    failure_condition=True,
+                    extra_log="{} is an unsupported operation".format(op),
+                )
+        if isinstance(result, pandas.DataFrame):
             from .dataframe import DataFrame
 
             return DataFrame(result)
@@ -488,8 +537,6 @@ class BasePandasDataset(object):
             return Series(result)
         # inplace
         elif result is None:
-            import modin.pandas as pd
-
             return self._create_or_update_from_compiler(
                 getattr(pd, type(pandas_obj).__name__)(pandas_obj)._query_compiler,
                 inplace=True,
@@ -520,7 +567,7 @@ class BasePandasDataset(object):
 
         Parameters
         ----------
-        axis : int, str
+        axis : int, str or pandas._libs.lib.NoDefault
             Axis name ('index' or 'columns') or number to be converted to axis index.
 
         Returns
@@ -528,27 +575,27 @@ class BasePandasDataset(object):
         int
             0 or 1 - axis index in the array of axes stored in the dataframe.
         """
+        if axis is lib.no_default:
+            axis = None
+
         return cls._pandas_class._get_axis_number(axis) if axis is not None else 0
 
-    def __constructor__(self, *args, **kwargs):
+    @pandas.util.cache_readonly
+    def __constructor__(self) -> BasePandasDataset:
         """
         Construct DataFrame or Series object depending on self type.
-
-        Parameters
-        ----------
-        *args : list
-            Additional positional arguments to be passed to constructor.
-        **kwargs : dict
-            Additional keywords arguments to be passed to constructor.
 
         Returns
         -------
         modin.pandas.BasePandasDataset
             Constructed object.
         """
-        return type(self)(*args, **kwargs)
+        return type(self)
 
-    def abs(self):
+    def abs(self):  # noqa: RT01, D200
+        """
+        Return a `BasePandasDataset` with absolute numeric value of each element.
+        """
         self._validate_dtypes(numeric_only=True)
         return self.__constructor__(query_compiler=self._query_compiler.abs())
 
@@ -576,12 +623,36 @@ class BasePandasDataset(object):
 
     index = property(_get_index, _set_index)
 
-    def add(self, other, axis="columns", level=None, fill_value=None):
+    def _get_axis(self, axis):
+        """
+        Return index labels of the specified axis.
+
+        Parameters
+        ----------
+        axis : {0, 1}
+            Axis to return labels on.
+            0 is for index, when 1 is for columns.
+
+        Returns
+        -------
+        pandas.Index
+        """
+        return self.index if axis == 0 else self.columns
+
+    def add(
+        self, other, axis="columns", level=None, fill_value=None
+    ):  # noqa: PR01, RT01, D200
+        """
+        Return addition of `BasePandasDataset` and `other`, element-wise (binary operator `add`).
+        """
         return self._binary_op(
             "add", other, axis=axis, level=level, fill_value=fill_value
         )
 
-    def aggregate(self, func=None, axis=0, *args, **kwargs):
+    def aggregate(self, func=None, axis=0, *args, **kwargs):  # noqa: PR01, RT01, D200
+        """
+        Aggregate using one or more operations over the specified axis.
+        """
         axis = self._get_axis_number(axis)
         result = None
 
@@ -683,16 +754,57 @@ class BasePandasDataset(object):
         join="outer",
         axis=None,
         level=None,
-        copy=True,
+        copy=None,
         fill_value=None,
-        method=None,
-        limit=None,
-        fill_axis=0,
-        broadcast_axis=None,
-    ):
-        return self._default_to_pandas(
-            "align",
-            other,
+        method=lib.no_default,
+        limit=lib.no_default,
+        fill_axis=lib.no_default,
+        broadcast_axis=lib.no_default,
+    ):  # noqa: PR01, RT01, D200
+        """
+        Align two objects on their axes with the specified join method.
+        """
+        if (
+            method is not lib.no_default
+            or limit is not lib.no_default
+            or fill_axis is not lib.no_default
+        ):
+            warnings.warn(
+                "The 'method', 'limit', and 'fill_axis' keywords in "
+                + f"{type(self).__name__}.align are deprecated and will be removed "
+                + "in a future version. Call fillna directly on the returned objects "
+                + "instead.",
+                FutureWarning,
+            )
+        if fill_axis is lib.no_default:
+            fill_axis = 0
+        if method is lib.no_default:
+            method = None
+        if limit is lib.no_default:
+            limit = None
+
+        if broadcast_axis is not lib.no_default:
+            msg = (
+                f"The 'broadcast_axis' keyword in {type(self).__name__}.align is "
+                + "deprecated and will be removed in a future version."
+            )
+            if broadcast_axis is not None:
+                if self.ndim == 1 and other.ndim == 2:
+                    msg += (
+                        " Use left = DataFrame({col: left for col in right.columns}, "
+                        + "index=right.index) before calling `left.align(right)` instead."
+                    )
+                elif self.ndim == 2 and other.ndim == 1:
+                    msg += (
+                        " Use right = DataFrame({col: right for col in left.columns}, "
+                        + "index=left.index) before calling `left.align(right)` instead"
+                    )
+            warnings.warn(msg, FutureWarning)
+        else:
+            broadcast_axis = None
+
+        left, right = self._query_compiler.align(
+            other._query_compiler,
             join=join,
             axis=axis,
             level=level,
@@ -703,8 +815,17 @@ class BasePandasDataset(object):
             fill_axis=fill_axis,
             broadcast_axis=broadcast_axis,
         )
+        return self.__constructor__(query_compiler=left), self.__constructor__(
+            query_compiler=right
+        )
 
-    def all(self, axis=0, bool_only=None, skipna=True, level=None, **kwargs):
+    def all(
+        self, axis=0, bool_only=False, skipna=True, **kwargs
+    ):  # noqa: PR01, RT01, D200
+        """
+        Return whether all elements are True, potentially over an axis.
+        """
+        validate_bool_kwarg(skipna, "skipna", none_allowed=False)
         if axis is not None:
             axis = self._get_axis_number(axis)
             if bool_only and axis == 0:
@@ -714,54 +835,42 @@ class BasePandasDataset(object):
                             type(self).__name__, "all"
                         )
                     )
-                data_for_compute = self[self.columns[self.dtypes == np.bool]]
+                data_for_compute = self[self.columns[self.dtypes == np.bool_]]
                 return data_for_compute.all(
-                    axis=axis, bool_only=False, skipna=skipna, level=level, **kwargs
+                    axis=axis, bool_only=False, skipna=skipna, **kwargs
                 )
-            if level is not None:
-                if bool_only is not None:
-                    raise NotImplementedError(
-                        "Option bool_only is not implemented with option level."
-                    )
-                if (
-                    not self._query_compiler.has_multiindex(axis=axis)
-                    and (level > 0 or level < -1)
-                    and level != self.index.name
-                ):
-                    raise ValueError(
-                        "level > 0 or level < -1 only valid with MultiIndex"
-                    )
-                return self.groupby(level=level, axis=axis, sort=False).all(**kwargs)
             return self._reduce_dimension(
                 self._query_compiler.all(
-                    axis=axis, bool_only=bool_only, skipna=skipna, level=level, **kwargs
+                    axis=axis, bool_only=bool_only, skipna=skipna, **kwargs
                 )
             )
         else:
             if bool_only:
                 raise ValueError("Axis must be 0 or 1 (got {})".format(axis))
             # Reduce to a scalar if axis is None.
-            if level is not None:
-                raise ValueError("Must specify 'axis' when aggregating by level")
-            else:
-                result = self._reduce_dimension(
-                    # FIXME: Judging by pandas docs `**kwargs` serves only compatibility
-                    # purpose and does not affect the result, we shouldn't pass them to the query compiler.
-                    self._query_compiler.all(
-                        axis=0,
-                        bool_only=bool_only,
-                        skipna=skipna,
-                        level=level,
-                        **kwargs,
-                    )
+            result = self._reduce_dimension(
+                # FIXME: Judging by pandas docs `**kwargs` serves only compatibility
+                # purpose and does not affect the result, we shouldn't pass them to the query compiler.
+                self._query_compiler.all(
+                    axis=0,
+                    bool_only=bool_only,
+                    skipna=skipna,
+                    **kwargs,
                 )
+            )
             if isinstance(result, BasePandasDataset):
                 return result.all(
-                    axis=axis, bool_only=bool_only, skipna=skipna, level=level, **kwargs
+                    axis=axis, bool_only=bool_only, skipna=skipna, **kwargs
                 )
             return result
 
-    def any(self, axis=0, bool_only=None, skipna=True, level=None, **kwargs):
+    def any(
+        self, *, axis=0, bool_only=False, skipna=True, **kwargs
+    ):  # noqa: PR01, RT01, D200
+        """
+        Return whether any element is True, potentially over an axis.
+        """
+        validate_bool_kwarg(skipna, "skipna", none_allowed=False)
         if axis is not None:
             axis = self._get_axis_number(axis)
             if bool_only and axis == 0:
@@ -771,63 +880,46 @@ class BasePandasDataset(object):
                             type(self).__name__, "all"
                         )
                     )
-                data_for_compute = self[self.columns[self.dtypes == np.bool]]
+                data_for_compute = self[self.columns[self.dtypes == np.bool_]]
                 return data_for_compute.any(
-                    axis=axis, bool_only=False, skipna=skipna, level=level, **kwargs
+                    axis=axis, bool_only=False, skipna=skipna, **kwargs
                 )
-            if level is not None:
-                if bool_only is not None:
-                    raise NotImplementedError(
-                        "Option bool_only is not implemented with option level."
-                    )
-                if (
-                    not self._query_compiler.has_multiindex(axis=axis)
-                    and (level > 0 or level < -1)
-                    and level != self.index.name
-                ):
-                    raise ValueError(
-                        "level > 0 or level < -1 only valid with MultiIndex"
-                    )
-                return self.groupby(level=level, axis=axis, sort=False).any(**kwargs)
             return self._reduce_dimension(
                 self._query_compiler.any(
-                    axis=axis, bool_only=bool_only, skipna=skipna, level=level, **kwargs
+                    axis=axis, bool_only=bool_only, skipna=skipna, **kwargs
                 )
             )
         else:
             if bool_only:
                 raise ValueError("Axis must be 0 or 1 (got {})".format(axis))
             # Reduce to a scalar if axis is None.
-            if level is not None:
-                raise ValueError("Must specify 'axis' when aggregating by level")
-            else:
-                result = self._reduce_dimension(
-                    self._query_compiler.any(
-                        axis=0,
-                        bool_only=bool_only,
-                        skipna=skipna,
-                        level=level,
-                        **kwargs,
-                    )
+            result = self._reduce_dimension(
+                self._query_compiler.any(
+                    axis=0,
+                    bool_only=bool_only,
+                    skipna=skipna,
+                    **kwargs,
                 )
+            )
             if isinstance(result, BasePandasDataset):
                 return result.any(
-                    axis=axis, bool_only=bool_only, skipna=skipna, level=level, **kwargs
+                    axis=axis, bool_only=bool_only, skipna=skipna, **kwargs
                 )
             return result
 
     def apply(
         self,
         func,
-        axis=0,
-        broadcast=None,
-        raw=False,
-        reduce=None,
-        result_type=None,
-        convert_dtype=True,
-        args=(),
+        axis,
+        raw,
+        result_type,
+        args,
         **kwds,
-    ):
+    ):  # noqa: PR01, RT01, D200
+        """
+        Apply a function along an axis of the `BasePandasDataset`.
+        """
+
         def error_raiser(msg, exception):
             """Convert passed exception to the same type as pandas do and raise it."""
             # HACK: to concord with pandas error types by replacing all of the
@@ -837,7 +929,6 @@ class BasePandasDataset(object):
 
         self._validate_function(func, on_invalid=error_raiser)
         axis = self._get_axis_number(axis)
-        ErrorMessage.non_verified_udf()
         if isinstance(func, str):
             # if axis != 1 function can be bounded to the Series, which doesn't
             # support axis parameter
@@ -864,17 +955,26 @@ class BasePandasDataset(object):
         )
         return query_compiler
 
-    def asfreq(self, freq, method=None, how=None, normalize=False, fill_value=None):
-        return self._default_to_pandas(
-            "asfreq",
-            freq,
-            method=method,
-            how=how,
-            normalize=normalize,
-            fill_value=fill_value,
+    def asfreq(
+        self, freq, method=None, how=None, normalize=False, fill_value=None
+    ):  # noqa: PR01, RT01, D200
+        """
+        Convert time series to specified frequency.
+        """
+        return self.__constructor__(
+            query_compiler=self._query_compiler.asfreq(
+                freq=freq,
+                method=method,
+                how=how,
+                normalize=normalize,
+                fill_value=fill_value,
+            )
         )
 
-    def asof(self, where, subset=None):
+    def asof(self, where, subset=None):  # noqa: PR01, RT01, D200
+        """
+        Return the last row(s) without any NaNs before `where`.
+        """
         scalar = not is_list_like(where)
         if isinstance(where, pandas.Index):
             # Prevent accidental mutation of original:
@@ -899,62 +999,167 @@ class BasePandasDataset(object):
             result = result.squeeze()
         return result
 
-    def astype(self, dtype, copy=True, errors="raise"):
-        col_dtypes = {}
+    def astype(self, dtype, copy=None, errors="raise"):  # noqa: PR01, RT01, D200
+        """
+        Cast a Modin object to a specified dtype `dtype`.
+        """
+        if copy is None:
+            copy = True
+        # dtype can be a series, a dict, or a scalar. If it's series,
+        # convert it to a dict before passing it to the query compiler.
+        if isinstance(dtype, (pd.Series, pandas.Series)):
+            if not dtype.index.is_unique:
+                raise ValueError("cannot reindex on an axis with duplicate labels")
+            dtype = {column: dtype for column, dtype in dtype.items()}
+        # If we got a series or dict originally, dtype is a dict now. Its keys
+        # must be column names.
         if isinstance(dtype, dict):
+            # avoid materializing columns in lazy mode. the query compiler
+            # will handle errors where dtype dict includes keys that are not
+            # in columns.
             if (
-                not set(dtype.keys()).issubset(set(self._query_compiler.columns))
+                not self._query_compiler.lazy_execution
+                and not set(dtype.keys()).issubset(set(self._query_compiler.columns))
                 and errors == "raise"
             ):
                 raise KeyError(
-                    "Only a column name can be used for the key in"
-                    "a dtype mappings argument."
+                    "Only a column name can be used for the key in "
+                    + "a dtype mappings argument."
                 )
-            col_dtypes = dtype
-        else:
-            for column in self._query_compiler.columns:
-                col_dtypes[column] = dtype
 
-        new_query_compiler = self._query_compiler.astype(col_dtypes)
-        return self._create_or_update_from_compiler(new_query_compiler, not copy)
+        if not copy:
+            # If the new types match the old ones, then copying can be avoided
+            if self._query_compiler._modin_frame.has_materialized_dtypes:
+                frame_dtypes = self._query_compiler._modin_frame.dtypes
+                if isinstance(dtype, dict):
+                    for col in dtype:
+                        if dtype[col] != frame_dtypes[col]:
+                            copy = True
+                            break
+                else:
+                    if not (frame_dtypes == dtype).all():
+                        copy = True
+            else:
+                copy = True
+
+        if copy:
+            new_query_compiler = self._query_compiler.astype(dtype, errors=errors)
+            return self._create_or_update_from_compiler(new_query_compiler)
+        return self
 
     @property
-    def at(self, axis=None):
+    def at(self, axis=None):  # noqa: PR01, RT01, D200
+        """
+        Get a single value for a row/column label pair.
+        """
         from .indexing import _LocIndexer
 
         return _LocIndexer(self)
 
-    def at_time(self, time, asof=False, axis=None):
-        axis = self._get_axis_number(axis)
-        idx = self.index if axis == 0 else self.columns
-        indexer = pandas.Series(index=idx).at_time(time, asof=asof).index
-        return self.loc[indexer] if axis == 0 else self.loc[:, indexer]
+    def at_time(self, time, asof=False, axis=None):  # noqa: PR01, RT01, D200
+        """
+        Select values at particular time of day (e.g., 9:30AM).
+        """
+        if asof:
+            # pandas raises NotImplementedError for asof=True, so we do, too.
+            raise NotImplementedError("'asof' argument is not supported")
+        return self.between_time(
+            start_time=time, end_time=time, inclusive="both", axis=axis
+        )
 
+    @_inherit_docstrings(
+        pandas.DataFrame.between_time, apilink="pandas.DataFrame.between_time"
+    )
     def between_time(
-        self, start_time, end_time, include_start=True, include_end=True, axis=None
-    ):
-        axis = self._get_axis_number(axis)
-        idx = self.index if axis == 0 else self.columns
-        indexer = (
-            pandas.Series(index=idx)
-            .between_time(
-                start_time,
-                end_time,
-                include_start=include_start,
-                include_end=include_end,
+        self: "BasePandasDataset",
+        start_time,
+        end_time,
+        inclusive="both",
+        axis=None,
+    ):  # noqa: PR01, RT01, D200
+        return self._create_or_update_from_compiler(
+            self._query_compiler.between_time(
+                start_time=pandas.core.tools.times.to_time(start_time),
+                end_time=pandas.core.tools.times.to_time(end_time),
+                inclusive=inclusive,
+                axis=self._get_axis_number(axis),
             )
-            .index
-        )
-        return self.loc[indexer] if axis == 0 else self.loc[:, indexer]
-
-    def bfill(self, axis=None, inplace=False, limit=None, downcast=None):
-        return self.fillna(
-            method="bfill", axis=axis, limit=limit, downcast=downcast, inplace=inplace
         )
 
-    backfill = bfill
+    def _deprecate_downcast(self, downcast, method_name: str):
+        if downcast is not lib.no_default:
+            warnings.warn(
+                f"The 'downcast' keyword in {method_name} is deprecated and "
+                + "will be removed in a future version. Use "
+                + "res.infer_objects(copy=False) to infer non-object dtype, or "
+                + "pd.to_numeric with the 'downcast' keyword to downcast numeric "
+                + "results.",
+                FutureWarning,
+            )
+        else:
+            downcast = None
+        return downcast
 
-    def bool(self):
+    def bfill(
+        self,
+        *,
+        axis=None,
+        inplace=False,
+        limit=None,
+        limit_area=None,
+        downcast=lib.no_default,
+    ):  # noqa: PR01, RT01, D200
+        """
+        Synonym for `DataFrame.fillna` with ``method='bfill'``.
+        """
+        if limit_area is not None:
+            return self._default_to_pandas(
+                "bfill",
+                reason="'limit_area' parameter isn't supported",
+                axis=axis,
+                inplace=inplace,
+                limit=limit,
+                limit_area=limit_area,
+                downcast=downcast,
+            )
+        downcast = self._deprecate_downcast(downcast, "bfill")
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore", ".*fillna with 'method' is deprecated", category=FutureWarning
+            )
+            return self.fillna(
+                method="bfill",
+                axis=axis,
+                limit=limit,
+                downcast=downcast,
+                inplace=inplace,
+            )
+
+    def backfill(
+        self, *, axis=None, inplace=False, limit=None, downcast=lib.no_default
+    ):  # noqa: PR01, RT01, D200
+        """
+        Synonym for `DataFrame.bfill`.
+        """
+        warnings.warn(
+            "DataFrame.backfill/Series.backfill is deprecated. Use DataFrame.bfill/Series.bfill instead",
+            FutureWarning,
+        )
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=FutureWarning)
+            return self.bfill(
+                axis=axis, inplace=inplace, limit=limit, downcast=downcast
+            )
+
+    def bool(self):  # noqa: RT01, D200
+        """
+        Return the bool of a single element `BasePandasDataset`.
+        """
+        warnings.warn(
+            f"{type(self).__name__}.bool is now deprecated and will be removed "
+            + "in future version of pandas",
+            FutureWarning,
+        )
         shape = self.shape
         if shape != (1,) and shape != (1, 1):
             raise ValueError(
@@ -967,60 +1172,74 @@ class BasePandasDataset(object):
         else:
             return self._to_pandas().bool()
 
-    def clip(self, lower=None, upper=None, axis=None, inplace=False, *args, **kwargs):
+    def clip(
+        self, lower=None, upper=None, *, axis=None, inplace=False, **kwargs
+    ):  # noqa: PR01, RT01, D200
+        """
+        Trim values at input threshold(s).
+        """
         # validate inputs
         if axis is not None:
             axis = self._get_axis_number(axis)
         self._validate_dtypes(numeric_only=True)
-        if is_list_like(lower) or is_list_like(upper):
-            if axis is None:
-                raise ValueError("Must specify axis = 0 or 1")
-            self._validate_other(lower, axis)
-            self._validate_other(upper, axis)
         inplace = validate_bool_kwarg(inplace, "inplace")
-        axis = numpy_compat.function.validate_clip_with_axis(axis, args, kwargs)
+        axis = numpy_compat.function.validate_clip_with_axis(axis, (), kwargs)
         # any np.nan bounds are treated as None
         if lower is not None and np.any(np.isnan(lower)):
             lower = None
         if upper is not None and np.any(np.isnan(upper)):
             upper = None
+        if is_list_like(lower) or is_list_like(upper):
+            lower = self._validate_other(lower, axis)
+            upper = self._validate_other(upper, axis)
         # FIXME: Judging by pandas docs `*args` and `**kwargs` serves only compatibility
         # purpose and does not affect the result, we shouldn't pass them to the query compiler.
         new_query_compiler = self._query_compiler.clip(
-            lower=lower, upper=upper, axis=axis, inplace=inplace, *args, **kwargs
+            lower=lower, upper=upper, axis=axis, **kwargs
         )
         return self._create_or_update_from_compiler(new_query_compiler, inplace)
 
-    def combine(self, other, func, fill_value=None, **kwargs):
+    def combine(self, other, func, fill_value=None, **kwargs):  # noqa: PR01, RT01, D200
+        """
+        Perform combination of `BasePandasDataset`-s according to `func`.
+        """
         return self._binary_op(
             "combine", other, _axis=0, func=func, fill_value=fill_value, **kwargs
         )
 
-    def combine_first(self, other):
+    def combine_first(self, other):  # noqa: PR01, RT01, D200
+        """
+        Update null elements with value in the same location in `other`.
+        """
         return self._binary_op("combine_first", other, _axis=0)
 
-    def copy(self, deep=True):
+    def copy(self, deep=True):  # noqa: PR01, RT01, D200
+        """
+        Make a copy of the object's metadata.
+        """
         if deep:
             return self.__constructor__(query_compiler=self._query_compiler.copy())
         new_obj = self.__constructor__(query_compiler=self._query_compiler)
         self._add_sibling(new_obj)
         return new_obj
 
-    def count(self, axis=0, level=None, numeric_only=False):
+    def count(self, axis=0, numeric_only=False):  # noqa: PR01, RT01, D200
+        """
+        Count non-NA cells for `BasePandasDataset`.
+        """
         axis = self._get_axis_number(axis)
-        frame = self.select_dtypes([np.number, np.bool]) if numeric_only else self
+        # select_dtypes is only implemented on DataFrames, but the numeric_only
+        # flag will always be set to false by the Series frontend
+        frame = self.select_dtypes([np.number, np.bool_]) if numeric_only else self
 
-        if level is not None:
-            if not frame._query_compiler.has_multiindex(axis=axis):
-                raise TypeError("Can only count levels on hierarchical columns.")
-            return frame.groupby(level=level, axis=axis, sort=True).count()
         return frame._reduce_dimension(
-            frame._query_compiler.count(
-                axis=axis, level=level, numeric_only=numeric_only
-            )
+            frame._query_compiler.count(axis=axis, numeric_only=numeric_only)
         )
 
-    def cummax(self, axis=None, skipna=True, *args, **kwargs):
+    def cummax(self, axis=None, skipna=True, *args, **kwargs):  # noqa: PR01, RT01, D200
+        """
+        Return cumulative maximum over a `BasePandasDataset` axis.
+        """
         axis = self._get_axis_number(axis)
         if axis == 1:
             self._validate_dtypes(numeric_only=True)
@@ -1028,11 +1247,14 @@ class BasePandasDataset(object):
             # FIXME: Judging by pandas docs `*args` and `**kwargs` serves only compatibility
             # purpose and does not affect the result, we shouldn't pass them to the query compiler.
             query_compiler=self._query_compiler.cummax(
-                axis=axis, skipna=skipna, **kwargs
+                fold_axis=axis, axis=axis, skipna=skipna, **kwargs
             )
         )
 
-    def cummin(self, axis=None, skipna=True, *args, **kwargs):
+    def cummin(self, axis=None, skipna=True, *args, **kwargs):  # noqa: PR01, RT01, D200
+        """
+        Return cumulative minimum over a `BasePandasDataset` axis.
+        """
         axis = self._get_axis_number(axis)
         if axis == 1:
             self._validate_dtypes(numeric_only=True)
@@ -1040,108 +1262,110 @@ class BasePandasDataset(object):
             # FIXME: Judging by pandas docs `*args` and `**kwargs` serves only compatibility
             # purpose and does not affect the result, we shouldn't pass them to the query compiler.
             query_compiler=self._query_compiler.cummin(
-                axis=axis, skipna=skipna, **kwargs
+                fold_axis=axis, axis=axis, skipna=skipna, **kwargs
             )
         )
 
-    def cumprod(self, axis=None, skipna=True, *args, **kwargs):
+    def cumprod(
+        self, axis=None, skipna=True, *args, **kwargs
+    ):  # noqa: PR01, RT01, D200
+        """
+        Return cumulative product over a `BasePandasDataset` axis.
+        """
         axis = self._get_axis_number(axis)
         self._validate_dtypes(numeric_only=True)
         return self.__constructor__(
             # FIXME: Judging by pandas docs `**kwargs` serves only compatibility
             # purpose and does not affect the result, we shouldn't pass them to the query compiler.
             query_compiler=self._query_compiler.cumprod(
-                axis=axis, skipna=skipna, **kwargs
+                fold_axis=axis, axis=axis, skipna=skipna, **kwargs
             )
         )
 
-    def cumsum(self, axis=None, skipna=True, *args, **kwargs):
+    def cumsum(self, axis=None, skipna=True, *args, **kwargs):  # noqa: PR01, RT01, D200
+        """
+        Return cumulative sum over a `BasePandasDataset` axis.
+        """
         axis = self._get_axis_number(axis)
         self._validate_dtypes(numeric_only=True)
         return self.__constructor__(
             # FIXME: Judging by pandas docs `*args` and `**kwargs` serves only compatibility
             # purpose and does not affect the result, we shouldn't pass them to the query compiler.
             query_compiler=self._query_compiler.cumsum(
-                axis=axis, skipna=skipna, **kwargs
+                fold_axis=axis, axis=axis, skipna=skipna, **kwargs
             )
         )
 
     def describe(
-        self, percentiles=None, include=None, exclude=None, datetime_is_numeric=False
-    ):
-        if include is not None and (isinstance(include, np.dtype) or include != "all"):
-            if not is_list_like(include):
-                include = [include]
-            include = [
-                np.dtype(i)
-                if not (isinstance(i, type) and i.__module__ == "numpy")
-                else i
-                for i in include
-            ]
-            if not any(
-                (isinstance(inc, np.dtype) and inc == d)
-                or (
-                    not isinstance(inc, np.dtype)
-                    and inc.__subclasscheck__(getattr(np, d.__str__()))
+        self,
+        percentiles=None,
+        include=None,
+        exclude=None,
+    ):  # noqa: PR01, RT01, D200
+        """
+        Generate descriptive statistics.
+        """
+        # copied from pandas.core.describe.describe_ndframe
+        percentiles = _refine_percentiles(percentiles)
+        data = self
+        if self._is_dataframe:
+            # include/exclude arguments are ignored for Series
+            if (include is None) and (exclude is None):
+                # when some numerics are found, keep only numerics
+                default_include: list[npt.DTypeLike] = [np.number]
+                default_include.append("datetime")
+                data = self.select_dtypes(include=default_include)
+                if len(data.columns) == 0:
+                    data = self
+            elif include == "all":
+                if exclude is not None:
+                    msg = "exclude must be None when include is 'all'"
+                    raise ValueError(msg)
+                data = self
+            else:
+                data = self.select_dtypes(
+                    include=include,
+                    exclude=exclude,
                 )
-                for d in self._get_dtypes()
-                for inc in include
-            ):
-                # This is the error that pandas throws.
-                raise ValueError("No objects to concatenate")
-        if exclude is not None:
-            if not is_list_like(exclude):
-                exclude = [exclude]
-            exclude = [np.dtype(e) for e in exclude]
-            if all(
-                (isinstance(exc, np.dtype) and exc == d)
-                or (
-                    not isinstance(exc, np.dtype)
-                    and exc.__subclasscheck__(getattr(np, d.__str__()))
-                )
-                for d in self._get_dtypes()
-                for exc in exclude
-            ):
-                # This is the error that pandas throws.
-                raise ValueError("No objects to concatenate")
-        if percentiles is not None:
-            # explicit conversion of `percentiles` to list
-            percentiles = list(percentiles)
-
-            # get them all to be in [0, 1]
-            validate_percentile(percentiles)
-
-            # median should always be included
-            if 0.5 not in percentiles:
-                percentiles.append(0.5)
-            percentiles = np.asarray(percentiles)
-        else:
-            percentiles = np.array([0.25, 0.5, 0.75])
+        if data.empty:
+            # Match pandas error from concatenting empty list of series descriptions.
+            raise ValueError("No objects to concatenate")
         return self.__constructor__(
-            query_compiler=self._query_compiler.describe(
-                percentiles=percentiles,
-                include=include,
-                exclude=exclude,
-                datetime_is_numeric=datetime_is_numeric,
-            )
+            query_compiler=data._query_compiler.describe(percentiles=percentiles)
         )
 
-    def diff(self, periods=1, axis=0):
+    def diff(self, periods=1, axis=0):  # noqa: PR01, RT01, D200
+        """
+        First discrete difference of element.
+        """
+        # Attempting to match pandas error behavior here
+        if not isinstance(periods, int):
+            raise ValueError(f"periods must be an int. got {type(periods)} instead")
+
+        # Attempting to match pandas error behavior here
+        for dtype in self._get_dtypes():
+            if not (is_numeric_dtype(dtype) or lib.is_np_dtype(dtype, "mM")):
+                raise TypeError(f"unsupported operand type for -: got {dtype}")
+
         axis = self._get_axis_number(axis)
         return self.__constructor__(
-            query_compiler=self._query_compiler.diff(periods=periods, axis=axis)
+            query_compiler=self._query_compiler.diff(axis=axis, periods=periods)
         )
 
     def drop(
         self,
         labels=None,
+        *,
         axis=0,
         index=None,
         columns=None,
         level=None,
         inplace=False,
         errors="raise",
-    ):
+    ):  # noqa: PR01, RT01, D200
+        """
+        Drop specified labels from `BasePandasDataset`.
+        """
         # TODO implement level
         if level is not None:
             return self._default_to_pandas(
@@ -1159,69 +1383,66 @@ class BasePandasDataset(object):
         if labels is not None:
             if index is not None or columns is not None:
                 raise ValueError("Cannot specify both 'labels' and 'index'/'columns'")
-            axis = pandas.DataFrame()._get_axis_name(axis)
-            axes = {axis: labels}
+            axis_name = pandas.DataFrame._get_axis_name(axis)
+            axes = {axis_name: labels}
         elif index is not None or columns is not None:
-            axes, _ = pandas.DataFrame()._construct_axes_from_arguments(
-                (index, columns), {}
-            )
+            axes = {"index": index}
+            if self.ndim == 2:
+                axes["columns"] = columns
         else:
             raise ValueError(
                 "Need to specify at least one of 'labels', 'index' or 'columns'"
             )
 
-        # TODO Clean up this error checking
-        if "index" not in axes:
-            axes["index"] = None
-        elif axes["index"] is not None:
-            if not is_list_like(axes["index"]):
-                axes["index"] = [axes["index"]]
-            if errors == "raise":
-                non_existant = [obj for obj in axes["index"] if obj not in self.index]
-                if len(non_existant):
-                    raise ValueError(
-                        "labels {} not contained in axis".format(non_existant)
+        for axis in ["index", "columns"]:
+            if axis not in axes:
+                axes[axis] = None
+            elif axes[axis] is not None:
+                if not is_list_like(axes[axis]):
+                    axes[axis] = [axes[axis]]
+                # In case of lazy execution we should bypass these error checking components
+                # because they can force the materialization of the row or column labels.
+                if self._query_compiler.lazy_execution:
+                    continue
+                if errors == "raise":
+                    non_existent = pandas.Index(axes[axis]).difference(
+                        getattr(self, axis)
                     )
-            else:
-                axes["index"] = [obj for obj in axes["index"] if obj in self.index]
-                # If the length is zero, we will just do nothing
-                if not len(axes["index"]):
-                    axes["index"] = None
-
-        if "columns" not in axes:
-            axes["columns"] = None
-        elif axes["columns"] is not None:
-            if not is_list_like(axes["columns"]):
-                axes["columns"] = [axes["columns"]]
-            if errors == "raise":
-                non_existant = [
-                    obj for obj in axes["columns"] if obj not in self.columns
-                ]
-                if len(non_existant):
-                    raise ValueError(
-                        "labels {} not contained in axis".format(non_existant)
-                    )
-            else:
-                axes["columns"] = [
-                    obj for obj in axes["columns"] if obj in self.columns
-                ]
-                # If the length is zero, we will just do nothing
-                if not len(axes["columns"]):
-                    axes["columns"] = None
+                    if len(non_existent):
+                        raise KeyError(f"labels {non_existent} not contained in axis")
+                else:
+                    axes[axis] = [
+                        obj for obj in axes[axis] if obj in getattr(self, axis)
+                    ]
+                    # If the length is zero, we will just do nothing
+                    if not len(axes[axis]):
+                        axes[axis] = None
 
         new_query_compiler = self._query_compiler.drop(
-            index=axes["index"], columns=axes["columns"]
+            index=axes["index"], columns=axes["columns"], errors=errors
         )
         return self._create_or_update_from_compiler(new_query_compiler, inplace)
 
-    def dropna(self, axis=0, how="any", thresh=None, subset=None, inplace=False):
+    def dropna(
+        self,
+        *,
+        axis: Axis = 0,
+        how: str | lib.NoDefault = lib.no_default,
+        thresh: int | lib.NoDefault = lib.no_default,
+        subset: IndexLabel = None,
+        inplace: bool = False,
+        ignore_index: bool = False,
+    ):  # noqa: PR01, RT01, D200
+        """
+        Remove missing values.
+        """
         inplace = validate_bool_kwarg(inplace, "inplace")
 
         if is_list_like(axis):
             raise TypeError("supplying multiple axes to axis is no longer supported.")
 
         axis = self._get_axis_number(axis)
-        if how is not None and how not in ["any", "all"]:
+        if how is not None and how not in ["any", "all", lib.no_default]:
             raise ValueError("invalid how option: %s" % how)
         if how is None and thresh is None:
             raise TypeError("must specify how or thresh")
@@ -1239,20 +1460,54 @@ class BasePandasDataset(object):
         new_query_compiler = self._query_compiler.dropna(
             axis=axis, how=how, thresh=thresh, subset=subset
         )
+        if ignore_index:
+            new_query_compiler.index = pandas.RangeIndex(
+                stop=len(new_query_compiler.index)
+            )
         return self._create_or_update_from_compiler(new_query_compiler, inplace)
 
-    def droplevel(self, level, axis=0):
+    def droplevel(self, level, axis=0):  # noqa: PR01, RT01, D200
+        """
+        Return `BasePandasDataset` with requested index / column level(s) removed.
+        """
         axis = self._get_axis_number(axis)
-        new_axis = self.axes[axis].droplevel(level)
         result = self.copy()
         if axis == 0:
-            result.index = new_axis
+            index_columns = result.index.names.copy()
+            if is_integer(level):
+                level = index_columns[level]
+            elif is_list_like(level):
+                level = [
+                    index_columns[lev] if is_integer(lev) else lev for lev in level
+                ]
+            if is_list_like(level):
+                for lev in level:
+                    index_columns.remove(lev)
+            else:
+                index_columns.remove(level)
+            if len(result.columns.names) > 1:
+                # In this case, we are dealing with a MultiIndex column, so we need to
+                # be careful when dropping the additional index column.
+                if is_list_like(level):
+                    drop_labels = [(lev, "") for lev in level]
+                else:
+                    drop_labels = [(level, "")]
+                result = result.reset_index().drop(columns=drop_labels)
+            else:
+                result = result.reset_index().drop(columns=level)
+            result = result.set_index(index_columns)
         else:
-            result.columns = new_axis
+            result.columns = self.columns.droplevel(level)
         return result
 
-    def drop_duplicates(self, keep="first", inplace=False, **kwargs):
+    def drop_duplicates(
+        self, keep="first", inplace=False, **kwargs
+    ):  # noqa: PR01, RT01, D200
+        """
+        Return `BasePandasDataset` with duplicate rows removed.
+        """
         inplace = validate_bool_kwarg(inplace, "inplace")
+        ignore_index = kwargs.get("ignore_index", False)
         subset = kwargs.get("subset", None)
         if subset is not None:
             if is_list_like(subset):
@@ -1260,16 +1515,27 @@ class BasePandasDataset(object):
                     subset = list(subset)
             else:
                 subset = [subset]
-            duplicates = self.duplicated(keep=keep, subset=subset)
+            if len(diff := pandas.Index(subset).difference(self.columns)) > 0:
+                raise KeyError(diff)
+        result_qc = self._query_compiler.unique(
+            keep=keep, ignore_index=ignore_index, subset=subset
+        )
+        result = self.__constructor__(query_compiler=result_qc)
+        if inplace:
+            self._update_inplace(result._query_compiler)
         else:
-            duplicates = self.duplicated(keep=keep)
-        indices = duplicates.values.nonzero()[0]
-        return self.drop(index=self.index[indices], inplace=inplace)
+            return result
 
-    def eq(self, other, axis="columns", level=None):
-        return self._binary_op("eq", other, axis=axis, level=level)
+    def eq(self, other, axis="columns", level=None):  # noqa: PR01, RT01, D200
+        """
+        Get equality of `BasePandasDataset` and `other`, element-wise (binary operator `eq`).
+        """
+        return self._binary_op("eq", other, axis=axis, level=level, dtypes=np.bool_)
 
-    def explode(self, column, ignore_index: bool = False):
+    def explode(self, column, ignore_index: bool = False):  # noqa: PR01, RT01, D200
+        """
+        Transform each element of a list-like to a row.
+        """
         exploded = self.__constructor__(
             query_compiler=self._query_compiler.explode(column)
         )
@@ -1279,16 +1545,20 @@ class BasePandasDataset(object):
 
     def ewm(
         self,
-        com=None,
-        span=None,
-        halflife=None,
-        alpha=None,
-        min_periods=0,
-        adjust=True,
-        ignore_na=False,
-        axis=0,
-        times=None,
-    ):
+        com: "float | None" = None,
+        span: "float | None" = None,
+        halflife: "float | TimedeltaConvertibleTypes | None" = None,
+        alpha: "float | None" = None,
+        min_periods: "int | None" = 0,
+        adjust: bool = True,
+        ignore_na: bool = False,
+        axis: "Axis" = lib.no_default,
+        times: "str | np.ndarray | BasePandasDataset | None" = None,
+        method: "str" = "single",
+    ) -> pandas.core.window.ewm.ExponentialMovingWindow:  # noqa: PR01, RT01, D200
+        """
+        Provide exponentially weighted (EW) calculations.
+        """
         return self._default_to_pandas(
             "ewm",
             com=com,
@@ -1300,25 +1570,96 @@ class BasePandasDataset(object):
             ignore_na=ignore_na,
             axis=axis,
             times=times,
+            method=method,
         )
 
-    def expanding(self, min_periods=1, center=None, axis=0, method="single"):
-        return self._default_to_pandas(
-            "expanding",
+    def expanding(
+        self, min_periods=1, axis=lib.no_default, method="single"
+    ):  # noqa: PR01, RT01, D200
+        """
+        Provide expanding window calculations.
+        """
+        from .window import Expanding
+
+        if axis is not lib.no_default:
+            axis = self._get_axis_number(axis)
+            name = "expanding"
+            if axis == 1:
+                warnings.warn(
+                    f"Support for axis=1 in {type(self).__name__}.{name} is "
+                    + "deprecated and will be removed in a future version. "
+                    + f"Use obj.T.{name}(...) instead",
+                    FutureWarning,
+                )
+            else:
+                warnings.warn(
+                    f"The 'axis' keyword in {type(self).__name__}.{name} is "
+                    + "deprecated and will be removed in a future version. "
+                    + "Call the method without the axis keyword instead.",
+                    FutureWarning,
+                )
+        else:
+            axis = 0
+
+        return Expanding(
+            self,
             min_periods=min_periods,
-            center=center,
             axis=axis,
             method=method,
         )
 
-    def ffill(self, axis=None, inplace=False, limit=None, downcast=None):
-        return self.fillna(
-            method="ffill", axis=axis, limit=limit, downcast=downcast, inplace=inplace
+    def ffill(
+        self,
+        *,
+        axis=None,
+        inplace=False,
+        limit=None,
+        limit_area=None,
+        downcast=lib.no_default,
+    ):  # noqa: PR01, RT01, D200
+        """
+        Synonym for `DataFrame.fillna` with ``method='ffill'``.
+        """
+        if limit_area is not None:
+            return self._default_to_pandas(
+                "ffill",
+                reason="'limit_area' parameter isn't supported",
+                axis=axis,
+                inplace=inplace,
+                limit=limit,
+                limit_area=limit_area,
+                downcast=downcast,
+            )
+        downcast = self._deprecate_downcast(downcast, "ffill")
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore", ".*fillna with 'method' is deprecated", category=FutureWarning
+            )
+            return self.fillna(
+                method="ffill",
+                axis=axis,
+                limit=limit,
+                downcast=downcast,
+                inplace=inplace,
+            )
+
+    def pad(
+        self, *, axis=None, inplace=False, limit=None, downcast=lib.no_default
+    ):  # noqa: PR01, RT01, D200
+        """
+        Synonym for `DataFrame.ffill`.
+        """
+        warnings.warn(
+            "DataFrame.pad/Series.pad is deprecated. Use DataFrame.ffill/Series.ffill instead",
+            FutureWarning,
         )
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=FutureWarning)
+            return self.ffill(
+                axis=axis, inplace=inplace, limit=limit, downcast=downcast
+            )
 
-    pad = ffill
-
-    def _fillna(
+    def fillna(
         self,
         squeeze_self,
         squeeze_value,
@@ -1327,7 +1668,7 @@ class BasePandasDataset(object):
         axis=None,
         inplace=False,
         limit=None,
-        downcast=None,
+        downcast=lib.no_default,
     ):
         """
         Fill NA/NaN values using the specified method.
@@ -1373,12 +1714,20 @@ class BasePandasDataset(object):
         Series, DataFrame or None
             Object with missing values filled or None if ``inplace=True``.
         """
+        if method is not None:
+            warnings.warn(
+                f"{type(self).__name__}.fillna with 'method' is deprecated and "
+                + "will raise in a future version. Use obj.ffill() or obj.bfill() "
+                + "instead.",
+                FutureWarning,
+            )
+        downcast = self._deprecate_downcast(downcast, "fillna")
         inplace = validate_bool_kwarg(inplace, "inplace")
         axis = self._get_axis_number(axis)
         if isinstance(value, (list, tuple)):
             raise TypeError(
                 '"value" parameter must be a scalar or dict, but '
-                'you passed a "{0}"'.format(type(value).__name__)
+                + f'you passed a "{type(value).__name__}"'
             )
         if value is None and method is None:
             raise ValueError("must specify a fill method or value")
@@ -1411,7 +1760,12 @@ class BasePandasDataset(object):
         )
         return self._create_or_update_from_compiler(new_query_compiler, inplace)
 
-    def filter(self, items=None, like=None, regex=None, axis=None):
+    def filter(
+        self, items=None, like=None, regex=None, axis=None
+    ):  # noqa: PR01, RT01, D200
+        """
+        Subset the `BasePandasDataset` rows or columns according to the specified index labels.
+        """
         nkw = count_not_none(items, like, regex)
         if nkw > 1:
             raise TypeError(
@@ -1444,56 +1798,106 @@ class BasePandasDataset(object):
             return self[bool_arr]
         return self[self.columns[bool_arr]]
 
-    def first(self, offset):
-        return self.loc[pandas.Series(index=self.index).first(offset).index]
+    def first(self, offset):  # noqa: PR01, RT01, D200
+        """
+        Select initial periods of time series data based on a date offset.
+        """
+        warnings.warn(
+            "first is deprecated and will be removed in a future version. "
+            + "Please create a mask and filter using `.loc` instead",
+            FutureWarning,
+        )
+        return self._create_or_update_from_compiler(
+            self._query_compiler.first(offset=to_offset(offset))
+        )
 
-    def first_valid_index(self):
+    def first_valid_index(self):  # noqa: RT01, D200
+        """
+        Return index for first non-NA value or None, if no non-NA value is found.
+        """
         return self._query_compiler.first_valid_index()
 
-    def floordiv(self, other, axis="columns", level=None, fill_value=None):
+    def floordiv(
+        self, other, axis="columns", level=None, fill_value=None
+    ):  # noqa: PR01, RT01, D200
+        """
+        Get integer division of `BasePandasDataset` and `other`, element-wise (binary operator `floordiv`).
+        """
         return self._binary_op(
             "floordiv", other, axis=axis, level=level, fill_value=fill_value
         )
 
-    def ge(self, other, axis="columns", level=None):
-        return self._binary_op("ge", other, axis=axis, level=level)
+    def ge(self, other, axis="columns", level=None):  # noqa: PR01, RT01, D200
+        """
+        Get greater than or equal comparison of `BasePandasDataset` and `other`, element-wise (binary operator `ge`).
+        """
+        return self._binary_op("ge", other, axis=axis, level=level, dtypes=np.bool_)
 
-    def get(self, key, default=None):
-        if key in self.keys():
+    def get(self, key, default=None):  # noqa: PR01, RT01, D200
+        """
+        Get item from object for given key.
+        """
+        # Match pandas behavior here
+        try:
             return self.__getitem__(key)
-        else:
+        except (KeyError, ValueError, IndexError):
             return default
 
-    def gt(self, other, axis="columns", level=None):
-        return self._binary_op("gt", other, axis=axis, level=level)
+    def gt(self, other, axis="columns", level=None):  # noqa: PR01, RT01, D200
+        """
+        Get greater than comparison of `BasePandasDataset` and `other`, element-wise (binary operator `gt`).
+        """
+        return self._binary_op("gt", other, axis=axis, level=level, dtypes=np.bool_)
 
-    def head(self, n=5):
+    def head(self, n=5):  # noqa: PR01, RT01, D200
+        """
+        Return the first `n` rows.
+        """
         return self.iloc[:n]
 
     @property
-    def iat(self, axis=None):
+    def iat(self, axis=None):  # noqa: PR01, RT01, D200
+        """
+        Get a single value for a row/column pair by integer position.
+        """
         from .indexing import _iLocIndexer
 
         return _iLocIndexer(self)
 
-    def idxmax(self, axis=0, skipna=True):
-        if not all(d != np.dtype("O") for d in self._get_dtypes()):
-            raise TypeError("reduction operation 'argmax' not allowed for this dtype")
+    def idxmax(self, axis=0, skipna=True, numeric_only=False):  # noqa: PR01, RT01, D200
+        """
+        Return index of first occurrence of maximum over requested axis.
+        """
+        if not all(d != pandas.api.types.pandas_dtype("O") for d in self._get_dtypes()):
+            raise TypeError("reduce operation 'argmax' not allowed for this dtype")
         axis = self._get_axis_number(axis)
         return self._reduce_dimension(
-            self._query_compiler.idxmax(axis=axis, skipna=skipna)
+            self._query_compiler.idxmax(
+                axis=axis, skipna=skipna, numeric_only=numeric_only
+            )
         )
 
-    def idxmin(self, axis=0, skipna=True):
-        if not all(d != np.dtype("O") for d in self._get_dtypes()):
-            raise TypeError("reduction operation 'argmin' not allowed for this dtype")
+    def idxmin(self, axis=0, skipna=True, numeric_only=False):  # noqa: PR01, RT01, D200
+        """
+        Return index of first occurrence of minimum over requested axis.
+        """
+        if not all(d != pandas.api.types.pandas_dtype("O") for d in self._get_dtypes()):
+            raise TypeError("reduce operation 'argmin' not allowed for this dtype")
         axis = self._get_axis_number(axis)
         return self._reduce_dimension(
-            self._query_compiler.idxmin(axis=axis, skipna=skipna)
+            self._query_compiler.idxmin(
+                axis=axis, skipna=skipna, numeric_only=numeric_only
+            )
         )
 
-    def infer_objects(self):
-        return self._default_to_pandas("infer_objects")
+    def infer_objects(self, copy=None):  # noqa: PR01, RT01, D200
+        """
+        Attempt to infer better dtypes for object columns.
+        """
+        new_query_compiler = self._query_compiler.infer_objects()
+        return self._create_or_update_from_compiler(
+            new_query_compiler, inplace=False if copy is None else not copy
+        )
 
     def convert_dtypes(
         self,
@@ -1502,155 +1906,195 @@ class BasePandasDataset(object):
         convert_integer: bool = True,
         convert_boolean: bool = True,
         convert_floating: bool = True,
-    ):
-        return self._default_to_pandas(
-            "convert_dtypes",
-            infer_objects=infer_objects,
-            convert_string=convert_string,
-            convert_integer=convert_integer,
-            convert_boolean=convert_boolean,
-        )
-
-    def isin(self, values):
+        dtype_backend: DtypeBackend = "numpy_nullable",
+    ):  # noqa: PR01, RT01, D200
+        """
+        Convert columns to best possible dtypes using dtypes supporting ``pd.NA``.
+        """
         return self.__constructor__(
-            query_compiler=self._query_compiler.isin(values=values)
+            query_compiler=self._query_compiler.convert_dtypes(
+                infer_objects=infer_objects,
+                convert_string=convert_string,
+                convert_integer=convert_integer,
+                convert_boolean=convert_boolean,
+                convert_floating=convert_floating,
+                dtype_backend=dtype_backend,
+            )
         )
 
-    def isna(self):
+    def isin(self, values):  # noqa: PR01, RT01, D200
+        """
+        Whether elements in `BasePandasDataset` are contained in `values`.
+        """
+        from .series import Series
+
+        ignore_indices = isinstance(values, Series)
+        values = getattr(values, "_query_compiler", values)
+        return self.__constructor__(
+            query_compiler=self._query_compiler.isin(
+                values=values, ignore_indices=ignore_indices
+            )
+        )
+
+    def isna(self):  # noqa: RT01, D200
+        """
+        Detect missing values.
+        """
         return self.__constructor__(query_compiler=self._query_compiler.isna())
 
     isnull = isna
 
     @property
-    def iloc(self):
+    def iloc(self):  # noqa: RT01, D200
+        """
+        Purely integer-location based indexing for selection by position.
+        """
         from .indexing import _iLocIndexer
 
         return _iLocIndexer(self)
 
-    def kurt(self, axis=None, skipna=None, level=None, numeric_only=None, **kwargs):
-        axis = self._get_axis_number(axis)
-        if skipna is None:
-            skipna = True
-        if level is not None:
-            func_kwargs = {
-                "skipna": skipna,
-                "level": level,
-                "numeric_only": numeric_only,
-            }
-
-            return self.__constructor__(
-                query_compiler=self._query_compiler.apply("kurt", axis, **func_kwargs)
-            )
-
-        if numeric_only is not None and not numeric_only:
-            self._validate_dtypes(numeric_only=True)
-
-        data = (
-            self._get_numeric_data(axis)
-            if numeric_only is None or numeric_only
-            else self
-        )
-
-        return self._reduce_dimension(
-            data._query_compiler.kurt(
-                axis=axis,
-                skipna=skipna,
-                level=level,
-                numeric_only=numeric_only,
-                **kwargs,
-            )
-        )
+    @_inherit_docstrings(pandas.DataFrame.kurt, apilink="pandas.DataFrame.kurt")
+    def kurt(self, axis=0, skipna=True, numeric_only=False, **kwargs):
+        return self._stat_operation("kurt", axis, skipna, numeric_only, **kwargs)
 
     kurtosis = kurt
 
-    def last(self, offset):
-        return self.loc[pandas.Series(index=self.index).last(offset).index]
+    def last(self, offset):  # noqa: PR01, RT01, D200
+        """
+        Select final periods of time series data based on a date offset.
+        """
+        warnings.warn(
+            "last is deprecated and will be removed in a future version. "
+            + "Please create a mask and filter using `.loc` instead",
+            FutureWarning,
+        )
 
-    def last_valid_index(self):
+        return self._create_or_update_from_compiler(
+            self._query_compiler.last(offset=to_offset(offset))
+        )
+
+    def last_valid_index(self):  # noqa: RT01, D200
+        """
+        Return index for last non-NA value or None, if no non-NA value is found.
+        """
         return self._query_compiler.last_valid_index()
 
-    def le(self, other, axis="columns", level=None):
-        return self._binary_op("le", other, axis=axis, level=level)
+    def le(self, other, axis="columns", level=None):  # noqa: PR01, RT01, D200
+        """
+        Get less than or equal comparison of `BasePandasDataset` and `other`, element-wise (binary operator `le`).
+        """
+        return self._binary_op("le", other, axis=axis, level=level, dtypes=np.bool_)
 
-    def lt(self, other, axis="columns", level=None):
-        return self._binary_op("lt", other, axis=axis, level=level)
+    def lt(self, other, axis="columns", level=None):  # noqa: PR01, RT01, D200
+        """
+        Get less than comparison of `BasePandasDataset` and `other`, element-wise (binary operator `lt`).
+        """
+        return self._binary_op("lt", other, axis=axis, level=level, dtypes=np.bool_)
 
     @property
-    def loc(self):
+    def loc(self):  # noqa: RT01, D200
+        """
+        Get a group of rows and columns by label(s) or a boolean array.
+        """
         from .indexing import _LocIndexer
 
         return _LocIndexer(self)
 
-    def mad(self, axis=None, skipna=None, level=None):
-        axis = self._get_axis_number(axis)
-        if skipna is None:
-            skipna = True
-        if level is not None:
-            if (
-                not self._query_compiler.has_multiindex(axis=axis)
-                and level > 0
-                or level < -1
-                and level != self.index.name
-            ):
-                raise ValueError("level > 0 or level < -1 only valid with MultiIndex")
-            return self.groupby(level=level, axis=axis, sort=False).mad()
-
-        return self._reduce_dimension(
-            self._query_compiler.mad(axis=axis, skipna=skipna, level=level)
-        )
-
     def mask(
         self,
         cond,
-        other=nan,
-        inplace=False,
-        axis=None,
-        level=None,
-        errors="raise",
-        try_cast=no_default,
-    ):
-        return self._default_to_pandas(
-            "mask",
-            cond,
-            other=other,
+        other=lib.no_default,
+        *,
+        inplace: bool = False,
+        axis: Optional[Axis] = None,
+        level: Optional[Level] = None,
+    ):  # noqa: PR01, RT01, D200
+        """
+        Replace values where the condition is True.
+        """
+        return self._create_or_update_from_compiler(
+            self._query_compiler.mask(
+                cond,
+                other=other,
+                inplace=False,
+                axis=axis,
+                level=level,
+            ),
             inplace=inplace,
-            axis=axis,
-            level=level,
-            errors=errors,
-            try_cast=try_cast,
         )
 
-    def max(self, axis=None, skipna=None, level=None, numeric_only=None, **kwargs):
-        if skipna is None:
-            skipna = True
-        if level is not None:
-            return self._default_to_pandas(
-                "max",
-                axis=axis,
-                skipna=skipna,
-                level=level,
-                numeric_only=numeric_only,
-                **kwargs,
-            )
+    def max(
+        self,
+        axis: Axis = 0,
+        skipna=True,
+        numeric_only=False,
+        **kwargs,
+    ):  # noqa: PR01, RT01, D200
+        """
+        Return the maximum of the values over the requested axis.
+        """
+        validate_bool_kwarg(skipna, "skipna", none_allowed=False)
+        orig_axis = axis
         axis = self._get_axis_number(axis)
         data = self._validate_dtypes_min_max(axis, numeric_only)
-        return data._reduce_dimension(
+        res = data._reduce_dimension(
             data._query_compiler.max(
                 axis=axis,
                 skipna=skipna,
-                level=level,
                 numeric_only=numeric_only,
                 **kwargs,
             )
         )
+        if orig_axis is None:
+            res = res._reduce_dimension(
+                res._query_compiler.max(
+                    axis=0,
+                    skipna=skipna,
+                    numeric_only=False,
+                    **kwargs,
+                )
+            )
+        return res
+
+    def min(
+        self,
+        axis: Axis = 0,
+        skipna: bool = True,
+        numeric_only=False,
+        **kwargs,
+    ):  # noqa: PR01, RT01, D200
+        """
+        Return the minimum of the values over the requested axis.
+        """
+        validate_bool_kwarg(skipna, "skipna", none_allowed=False)
+        orig_axis = axis
+        axis = self._get_axis_number(axis)
+        data = self._validate_dtypes_min_max(axis, numeric_only)
+        res = data._reduce_dimension(
+            data._query_compiler.min(
+                axis=axis,
+                skipna=skipna,
+                numeric_only=numeric_only,
+                **kwargs,
+            )
+        )
+        if orig_axis is None:
+            res = res._reduce_dimension(
+                res._query_compiler.min(
+                    axis=0,
+                    skipna=skipna,
+                    numeric_only=False,
+                    **kwargs,
+                )
+            )
+        return res
 
     def _stat_operation(
         self,
         op_name: str,
         axis: Union[int, str],
         skipna: bool,
-        level: Optional[Union[int, str]],
-        numeric_only: Optional[bool] = None,
+        numeric_only: Optional[bool] = False,
         **kwargs,
     ):
         """
@@ -1664,10 +2108,7 @@ class BasePandasDataset(object):
             Axis to apply method on.
         skipna : bool
             Exclude NA/null values when computing the result.
-        level : int or str
-            If specified `axis` is a MultiIndex, applying method along a particular
-            level, collapsing into a Series.
-        numeric_only : bool, optional
+        numeric_only : bool, default: False
             Include only float, int, boolean columns. If None, will attempt
             to use everything, then use only numeric data.
         **kwargs : dict
@@ -1681,88 +2122,59 @@ class BasePandasDataset(object):
                 self is DataFrame and level is not specified.
             `DataFrame` - self is DataFrame and level is specified.
         """
-        axis = self._get_axis_number(axis)
-        if skipna is None:
-            skipna = True
-        if level is not None:
-            return self._default_to_pandas(
-                op_name,
-                axis=axis,
-                skipna=skipna,
-                level=level,
-                numeric_only=numeric_only,
-                **kwargs,
-            )
-        # If `numeric_only` is None, then we can do this precheck to whether or not
-        # frame contains non-numeric columns, if it doesn't, then we can pass to a query compiler
-        # `numeric_only=False` parameter and make its work easier in that case, rather than
-        # performing under complicate `numeric_only=None` parameter
+        axis = self._get_axis_number(axis) if axis is not None else None
+        validate_bool_kwarg(skipna, "skipna", none_allowed=False)
+        if op_name == "median":
+            numpy_compat.function.validate_median((), kwargs)
+        elif op_name in ("sem", "var", "std"):
+            val_kwargs = {k: v for k, v in kwargs.items() if k != "ddof"}
+            numpy_compat.function.validate_stat_ddof_func((), val_kwargs, fname=op_name)
+        else:
+            numpy_compat.function.validate_stat_func((), kwargs, fname=op_name)
+
         if not numeric_only:
-            try:
-                self._validate_dtypes(numeric_only=True)
-            except TypeError:
-                if numeric_only is not None:
-                    raise
-            else:
-                numeric_only = False
+            self._validate_dtypes(numeric_only=True)
 
         data = (
-            self._get_numeric_data(axis)
-            if numeric_only is None or numeric_only
+            self._get_numeric_data(axis if axis is not None else 0)
+            if numeric_only
             else self
         )
         result_qc = getattr(data._query_compiler, op_name)(
             axis=axis,
             skipna=skipna,
-            level=level,
             numeric_only=numeric_only,
             **kwargs,
         )
-        return self._reduce_dimension(result_qc)
-
-    def mean(self, axis=None, skipna=None, level=None, numeric_only=None, **kwargs):
-        return self._stat_operation("mean", axis, skipna, level, numeric_only, **kwargs)
-
-    def median(self, axis=None, skipna=None, level=None, numeric_only=None, **kwargs):
-        return self._stat_operation(
-            "median", axis, skipna, level, numeric_only, **kwargs
+        return (
+            self._reduce_dimension(result_qc)
+            if isinstance(result_qc, type(self._query_compiler))
+            # scalar case
+            else result_qc
         )
 
-    def memory_usage(self, index=True, deep=False):
+    def memory_usage(self, index=True, deep=False):  # noqa: PR01, RT01, D200
+        """
+        Return the memory usage of the `BasePandasDataset`.
+        """
         return self._reduce_dimension(
             self._query_compiler.memory_usage(index=index, deep=deep)
         )
 
-    def min(self, axis=None, skipna=None, level=None, numeric_only=None, **kwargs):
-        if skipna is None:
-            skipna = True
-        if level is not None:
-            return self._default_to_pandas(
-                "min",
-                axis=axis,
-                skipna=skipna,
-                level=level,
-                numeric_only=numeric_only,
-                **kwargs,
-            )
-        axis = self._get_axis_number(axis)
-        data = self._validate_dtypes_min_max(axis, numeric_only)
-        return data._reduce_dimension(
-            data._query_compiler.min(
-                axis=axis,
-                skipna=skipna,
-                level=level,
-                numeric_only=numeric_only,
-                **kwargs,
-            )
-        )
-
-    def mod(self, other, axis="columns", level=None, fill_value=None):
+    def mod(
+        self, other, axis="columns", level=None, fill_value=None
+    ):  # noqa: PR01, RT01, D200
+        """
+        Get modulo of `BasePandasDataset` and `other`, element-wise (binary operator `mod`).
+        """
         return self._binary_op(
             "mod", other, axis=axis, level=level, fill_value=fill_value
         )
 
-    def mode(self, axis=0, numeric_only=False, dropna=True):
+    def mode(self, axis=0, numeric_only=False, dropna=True):  # noqa: PR01, RT01, D200
+        """
+        Get the mode(s) of each element along the selected axis.
+        """
         axis = self._get_axis_number(axis)
         return self.__constructor__(
             query_compiler=self._query_compiler.mode(
@@ -1770,58 +2182,129 @@ class BasePandasDataset(object):
             )
         )
 
-    def mul(self, other, axis="columns", level=None, fill_value=None):
+    def mul(
+        self, other, axis="columns", level=None, fill_value=None
+    ):  # noqa: PR01, RT01, D200
+        """
+        Get multiplication of `BasePandasDataset` and `other`, element-wise (binary operator `mul`).
+        """
         return self._binary_op(
             "mul", other, axis=axis, level=level, fill_value=fill_value
         )
 
     multiply = mul
 
-    def ne(self, other, axis="columns", level=None):
-        return self._binary_op("ne", other, axis=axis, level=level)
+    def ne(self, other, axis="columns", level=None):  # noqa: PR01, RT01, D200
+        """
+        Get Not equal comparison of `BasePandasDataset` and `other`, element-wise (binary operator `ne`).
+        """
+        return self._binary_op("ne", other, axis=axis, level=level, dtypes=np.bool_)
 
-    def notna(self):
+    def notna(self):  # noqa: RT01, D200
+        """
+        Detect existing (non-missing) values.
+        """
         return self.__constructor__(query_compiler=self._query_compiler.notna())
 
     notnull = notna
 
-    def nunique(self, axis=0, dropna=True):
+    def nunique(self, axis=0, dropna=True):  # noqa: PR01, RT01, D200
+        """
+        Return number of unique elements in the `BasePandasDataset`.
+        """
         axis = self._get_axis_number(axis)
         return self._reduce_dimension(
             self._query_compiler.nunique(axis=axis, dropna=dropna)
         )
 
-    def pct_change(self, periods=1, fill_method="pad", limit=None, freq=None, **kwargs):
-        return self._default_to_pandas(
-            "pct_change",
-            periods=periods,
-            fill_method=fill_method,
-            limit=limit,
-            freq=freq,
-            **kwargs,
+    def pct_change(
+        self,
+        periods=1,
+        fill_method=lib.no_default,
+        limit=lib.no_default,
+        freq=None,
+        **kwargs,
+    ):  # noqa: PR01, RT01, D200
+        """
+        Percentage change between the current and a prior element.
+        """
+        if fill_method not in (lib.no_default, None) or limit is not lib.no_default:
+            warnings.warn(
+                "The 'fill_method' keyword being not None and the 'limit' keyword in "
+                + f"{type(self).__name__}.pct_change are deprecated and will be removed "
+                + "in a future version. Either fill in any non-leading NA values prior "
+                + "to calling pct_change or specify 'fill_method=None' to not fill NA "
+                + "values.",
+                FutureWarning,
+            )
+        if fill_method is lib.no_default:
+            if self.isna().values.any():
+                warnings.warn(
+                    "The default fill_method='pad' in "
+                    + f"{type(self).__name__}.pct_change is deprecated and will be "
+                    + "removed in a future version. Call ffill before calling "
+                    + "pct_change to retain current behavior and silence this warning.",
+                    FutureWarning,
+                )
+            fill_method = "pad"
+        if limit is lib.no_default:
+            limit = None
+
+        # Attempting to match pandas error behavior here
+        if not isinstance(periods, int):
+            raise ValueError(f"periods must be an int. got {type(periods)} instead")
+
+        # Attempting to match pandas error behavior here
+        for dtype in self._get_dtypes():
+            if not is_numeric_dtype(dtype):
+                raise TypeError(f"unsupported operand type for /: got {dtype}")
+
+        return self.__constructor__(
+            query_compiler=self._query_compiler.pct_change(
+                periods=periods,
+                fill_method=fill_method,
+                limit=limit,
+                freq=freq,
+                **kwargs,
+            )
         )
 
-    def pipe(self, func, *args, **kwargs):
+    def pipe(self, func, *args, **kwargs):  # noqa: PR01, RT01, D200
+        """
+        Apply chainable functions that expect `BasePandasDataset`.
+        """
         return pipe(self, func, *args, **kwargs)
 
-    def pop(self, item):
+    def pop(self, item):  # noqa: PR01, RT01, D200
+        """
+        Return item and drop from frame. Raise KeyError if not found.
+        """
         result = self[item]
         del self[item]
         return result
 
-    def pow(self, other, axis="columns", level=None, fill_value=None):
+    def pow(
+        self, other, axis="columns", level=None, fill_value=None
+    ):  # noqa: PR01, RT01, D200
+        """
+        Get exponential power of `BasePandasDataset` and `other`, element-wise (binary operator `pow`).
+        """
         return self._binary_op(
             "pow", other, axis=axis, level=level, fill_value=fill_value
         )
 
-    radd = add
-
-    def quantile(self, q=0.5, axis=0, numeric_only=True, interpolation="linear"):
+    def quantile(
+        self, q, axis, numeric_only, interpolation, method
+    ):  # noqa: PR01, RT01, D200
+        """
+        Return values at the given quantile over requested axis.
+        """
         axis = self._get_axis_number(axis)
 
         def check_dtype(t):
-            return is_numeric_dtype(t) or is_datetime_or_timedelta_dtype(t)
+            return is_numeric_dtype(t) or lib.is_np_dtype(t, "mM")
 
+        numeric_only_df = self
         if not numeric_only:
             # If not numeric_only and columns, then check all columns are either
             # numeric, timestamp, or timedelta
@@ -1840,46 +2323,55 @@ class BasePandasDataset(object):
                             )
                         )
         else:
-            # Normally pandas returns this near the end of the quantile, but we
-            # can't afford the overhead of running the entire operation before
-            # we error.
-            if not any(is_numeric_dtype(t) for t in self._get_dtypes()):
-                raise ValueError("need at least one array to concatenate")
+            numeric_only_df = self.drop(
+                columns=[
+                    i for i in self.dtypes.index if not is_numeric_dtype(self.dtypes[i])
+                ]
+            )
 
         # check that all qs are between 0 and 1
         validate_percentile(q)
-        axis = self._get_axis_number(axis)
-        if isinstance(q, (pandas.Series, np.ndarray, pandas.Index, list)):
-            return self.__constructor__(
-                query_compiler=self._query_compiler.quantile_for_list_of_values(
+        axis = numeric_only_df._get_axis_number(axis)
+        if isinstance(q, (pandas.Series, np.ndarray, pandas.Index, list, tuple)):
+            return numeric_only_df.__constructor__(
+                query_compiler=numeric_only_df._query_compiler.quantile_for_list_of_values(
                     q=q,
                     axis=axis,
-                    numeric_only=numeric_only,
+                    # `numeric_only=True` has already been processed by using `self.drop` function
+                    numeric_only=False,
                     interpolation=interpolation,
+                    method=method,
                 )
             )
         else:
-            result = self._reduce_dimension(
-                self._query_compiler.quantile_for_single_value(
+            result = numeric_only_df._reduce_dimension(
+                numeric_only_df._query_compiler.quantile_for_single_value(
                     q=q,
                     axis=axis,
-                    numeric_only=numeric_only,
+                    # `numeric_only=True` has already been processed by using `self.drop` function
+                    numeric_only=False,
                     interpolation=interpolation,
+                    method=method,
                 )
             )
             if isinstance(result, BasePandasDataset):
                 result.name = q
             return result
 
+    @_inherit_docstrings(pandas.DataFrame.rank, apilink="pandas.DataFrame.rank")
     def rank(
         self,
         axis=0,
-        method="average",
-        numeric_only=None,
-        na_option="keep",
-        ascending=True,
-        pct=False,
+        method: str = "average",
+        numeric_only=False,
+        na_option: str = "keep",
+        ascending: bool = True,
+        pct: bool = False,
     ):
+        if axis is None:
+            raise ValueError(
+                f"No axis named None for object type {type(self).__name__}"
+            )
         axis = self._get_axis_number(axis)
         return self.__constructor__(
             query_compiler=self._query_compiler.rank(
@@ -1892,28 +2384,47 @@ class BasePandasDataset(object):
             )
         )
 
+    def _copy_index_metadata(self, source, destination):  # noqa: PR01, RT01, D200
+        """
+        Copy Index metadata from `source` to `destination` inplace.
+        """
+        if hasattr(source, "name") and hasattr(destination, "name"):
+            destination.name = source.name
+        if hasattr(source, "names") and hasattr(destination, "names"):
+            destination.names = source.names
+        return destination
+
+    def _ensure_index(self, index_like, axis=0):  # noqa: PR01, RT01, D200
+        """
+        Ensure that we have an index from some index-like object.
+        """
+        if (
+            self._query_compiler.has_multiindex(axis=axis)
+            and not isinstance(index_like, pandas.Index)
+            and is_list_like(index_like)
+            and len(index_like) > 0
+            and isinstance(index_like[0], tuple)
+        ):
+            try:
+                return pandas.MultiIndex.from_tuples(index_like)
+            except TypeError:
+                # not all tuples
+                pass
+        return ensure_index(index_like)
+
     def reindex(
         self,
         index=None,
         columns=None,
         copy=True,
         **kwargs,
-    ):
-        if (
-            kwargs.get("level") is not None
-            or (index is not None and self._query_compiler.has_multiindex())
-            or (columns is not None and self._query_compiler.has_multiindex(axis=1))
-        ):
-            if index is not None:
-                kwargs["index"] = index
-            if columns is not None:
-                kwargs["columns"] = columns
-            return self._default_to_pandas("reindex", copy=copy, **kwargs)
+    ):  # noqa: PR01, RT01, D200
+        """
+        Conform `BasePandasDataset` to new index with optional filling logic.
+        """
         new_query_compiler = None
         if index is not None:
-            if not isinstance(index, pandas.Index):
-                index = pandas.Index(index)
-            if not index.equals(self.index):
+            if not isinstance(index, pandas.Index) or not index.equals(self.index):
                 new_query_compiler = self._query_compiler.reindex(
                     axis=0, labels=index, **kwargs
                 )
@@ -1921,46 +2432,40 @@ class BasePandasDataset(object):
             new_query_compiler = self._query_compiler
         final_query_compiler = None
         if columns is not None:
-            if not isinstance(columns, pandas.Index):
-                columns = pandas.Index(columns)
-            if not columns.equals(self.columns):
+            if not isinstance(index, pandas.Index) or not columns.equals(self.columns):
                 final_query_compiler = new_query_compiler.reindex(
                     axis=1, labels=columns, **kwargs
                 )
         if final_query_compiler is None:
             final_query_compiler = new_query_compiler
-        return self._create_or_update_from_compiler(final_query_compiler, not copy)
-
-    def reindex_like(self, other, method=None, copy=True, limit=None, tolerance=None):
-        return self._default_to_pandas(
-            "reindex_like",
-            other,
-            method=method,
-            copy=copy,
-            limit=limit,
-            tolerance=tolerance,
+        return self._create_or_update_from_compiler(
+            final_query_compiler, inplace=False if copy is None else not copy
         )
 
     def rename_axis(
-        self, mapper=None, index=None, columns=None, axis=None, copy=True, inplace=False
-    ):
-        kwargs = {
-            "index": index,
-            "columns": columns,
-            "axis": axis,
-            "copy": copy,
-            "inplace": inplace,
-        }
-        axes, kwargs = getattr(
-            pandas, type(self).__name__
-        )()._construct_axes_from_arguments((), kwargs, sentinel=sentinel)
+        self,
+        mapper=lib.no_default,
+        *,
+        index=lib.no_default,
+        columns=lib.no_default,
+        axis=0,
+        copy=None,
+        inplace=False,
+    ):  # noqa: PR01, RT01, D200
+        """
+        Set the name of the axis for the index or columns.
+        """
+        axes = {"index": index, "columns": columns}
+
+        if copy is None:
+            copy = True
+
         if axis is not None:
             axis = self._get_axis_number(axis)
-        else:
-            axis = 0
+
         inplace = validate_bool_kwarg(inplace, "inplace")
 
-        if mapper is not None:
+        if mapper is not lib.no_default:
             # Use v0.23 behavior if a scalar or list
             non_mapper = is_scalar(mapper) or (
                 is_list_like(mapper) and not is_dict_like(mapper)
@@ -1968,16 +2473,15 @@ class BasePandasDataset(object):
             if non_mapper:
                 return self._set_axis_name(mapper, axis=axis, inplace=inplace)
             else:
-                raise ValueError("Use `.rename` to alter labels " "with a mapper.")
+                raise ValueError("Use `.rename` to alter labels with a mapper.")
         else:
             # Use new behavior.  Means that index and/or columns is specified
             result = self if inplace else self.copy(deep=copy)
 
-            for axis in axes:
-                if axes[axis] is None:
+            for axis in range(self.ndim):
+                v = axes.get(pandas.DataFrame._get_axis_name(axis))
+                if v is lib.no_default:
                     continue
-                v = axes[axis]
-                axis = self._get_axis_number(axis)
                 non_mapper = is_scalar(v) or (is_list_like(v) and not is_dict_like(v))
                 if non_mapper:
                     newnames = v
@@ -2004,88 +2508,178 @@ class BasePandasDataset(object):
             if not inplace:
                 return result
 
-    def reorder_levels(self, order, axis=0):
+    def reorder_levels(self, order, axis=0):  # noqa: PR01, RT01, D200
+        """
+        Rearrange index levels using input order.
+        """
         axis = self._get_axis_number(axis)
-        new_labels = self.axes[axis].reorder_levels(order)
-        return self.set_axis(new_labels, axis=axis, inplace=False)
+        new_labels = self._get_axis(axis).reorder_levels(order)
+        return self.set_axis(new_labels, axis=axis)
 
     def resample(
         self,
         rule,
-        axis=0,
-        closed=None,
-        label=None,
-        convention="start",
-        kind=None,
-        loffset=None,
-        base: Optional[int] = None,
-        on=None,
-        level=None,
+        axis: Axis = lib.no_default,
+        closed: Optional[str] = None,
+        label: Optional[str] = None,
+        convention: str = lib.no_default,
+        kind: Optional[str] = lib.no_default,
+        on: Level = None,
+        level: Level = None,
         origin: Union[str, TimestampConvertibleTypes] = "start_day",
         offset: Optional[TimedeltaConvertibleTypes] = None,
-    ):
+        group_keys=False,
+    ):  # noqa: PR01, RT01, D200
+        """
+        Resample time-series data.
+        """
+        from .resample import Resampler
+
+        if axis is not lib.no_default:
+            axis = self._get_axis_number(axis)
+            if axis == 1:
+                warnings.warn(
+                    "DataFrame.resample with axis=1 is deprecated. Do "
+                    + "`frame.T.resample(...)` without axis instead.",
+                    FutureWarning,
+                )
+            else:
+                warnings.warn(
+                    f"The 'axis' keyword in {type(self).__name__}.resample is "
+                    + "deprecated and will be removed in a future version.",
+                    FutureWarning,
+                )
+        else:
+            axis = 0
+
         return Resampler(
-            self,
+            dataframe=self,
             rule=rule,
             axis=axis,
             closed=closed,
             label=label,
             convention=convention,
             kind=kind,
-            loffset=loffset,
-            base=base,
             on=on,
             level=level,
             origin=origin,
             offset=offset,
+            group_keys=group_keys,
         )
 
     def reset_index(
-        self, level=None, drop=False, inplace=False, col_level=0, col_fill=""
-    ):
+        self,
+        level: IndexLabel = None,
+        *,
+        drop: bool = False,
+        inplace: bool = False,
+        col_level: Hashable = 0,
+        col_fill: Hashable = "",
+        allow_duplicates=lib.no_default,
+        names: Hashable | Sequence[Hashable] = None,
+    ):  # noqa: PR01, RT01, D200
+        """
+        Reset the index, or a level of it.
+        """
         inplace = validate_bool_kwarg(inplace, "inplace")
         # Error checking for matching pandas. Pandas does not allow you to
         # insert a dropped index into a DataFrame if these columns already
         # exist.
         if (
             not drop
+            and not self._query_compiler.lazy_execution
             and not self._query_compiler.has_multiindex()
             and all(n in self.columns for n in ["level_0", "index"])
         ):
             raise ValueError("cannot insert level_0, already exists")
-        else:
-            new_query_compiler = self._query_compiler.reset_index(
-                drop=drop,
-                level=level,
-                col_level=col_level,
-                col_fill=col_fill,
-            )
+        new_query_compiler = self._query_compiler.reset_index(
+            drop=drop,
+            level=level,
+            col_level=col_level,
+            col_fill=col_fill,
+            allow_duplicates=allow_duplicates,
+            names=names,
+        )
         return self._create_or_update_from_compiler(new_query_compiler, inplace)
 
-    def rfloordiv(self, other, axis="columns", level=None, fill_value=None):
+    def radd(
+        self, other, axis="columns", level=None, fill_value=None
+    ):  # noqa: PR01, RT01, D200
+        """
+        Return addition of `BasePandasDataset` and `other`, element-wise (binary operator `radd`).
+        """
+        return self._binary_op(
+            "radd", other, axis=axis, level=level, fill_value=fill_value
+        )
+
+    def rfloordiv(
+        self, other, axis="columns", level=None, fill_value=None
+    ):  # noqa: PR01, RT01, D200
+        """
+        Get integer division of `BasePandasDataset` and `other`, element-wise (binary operator `rfloordiv`).
+        """
         return self._binary_op(
             "rfloordiv", other, axis=axis, level=level, fill_value=fill_value
         )
 
-    def rmod(self, other, axis="columns", level=None, fill_value=None):
+    def rmod(
+        self, other, axis="columns", level=None, fill_value=None
+    ):  # noqa: PR01, RT01, D200
+        """
+        Get modulo of `BasePandasDataset` and `other`, element-wise (binary operator `rmod`).
+        """
         return self._binary_op(
             "rmod", other, axis=axis, level=level, fill_value=fill_value
         )
 
-    rmul = mul
+    def rmul(
+        self, other, axis="columns", level=None, fill_value=None
+    ):  # noqa: PR01, RT01, D200
+        """
+        Get Multiplication of dataframe and other, element-wise (binary operator `rmul`).
+        """
+        return self._binary_op(
+            "rmul", other, axis=axis, level=level, fill_value=fill_value
+        )
 
     def rolling(
         self,
         window,
-        min_periods=None,
-        center=False,
-        win_type=None,
-        on=None,
-        axis=0,
-        closed=None,
-        method="single",
-    ):
+        min_periods: int | None = None,
+        center: bool = False,
+        win_type: str | None = None,
+        on: str | None = None,
+        axis: Axis = lib.no_default,
+        closed: str | None = None,
+        step: int | None = None,
+        method: str = "single",
+    ):  # noqa: PR01, RT01, D200
+        """
+        Provide rolling window calculations.
+        """
+        if axis is not lib.no_default:
+            axis = self._get_axis_number(axis)
+            name = "rolling"
+            if axis == 1:
+                warnings.warn(
+                    f"Support for axis=1 in {type(self).__name__}.{name} is "
+                    + "deprecated and will be removed in a future version. "
+                    + f"Use obj.T.{name}(...) instead",
+                    FutureWarning,
+                )
+            else:
+                warnings.warn(
+                    f"The 'axis' keyword in {type(self).__name__}.{name} is "
+                    + "deprecated and will be removed in a future version. "
+                    + "Call the method without the axis keyword instead.",
+                    FutureWarning,
+                )
+        else:
+            axis = 0
+
         if win_type is not None:
+            from .window import Window
+
             return Window(
                 self,
                 window=window,
@@ -2095,8 +2689,10 @@ class BasePandasDataset(object):
                 on=on,
                 axis=axis,
                 closed=closed,
+                step=step,
                 method=method,
             )
+        from .window import Rolling
 
         return Rolling(
             self,
@@ -2107,27 +2703,46 @@ class BasePandasDataset(object):
             on=on,
             axis=axis,
             closed=closed,
+            step=step,
             method=method,
         )
 
-    def round(self, decimals=0, *args, **kwargs):
+    def round(self, decimals=0, *args, **kwargs):  # noqa: PR01, RT01, D200
+        """
+        Round a `BasePandasDataset` to a variable number of decimal places.
+        """
         # FIXME: Judging by pandas docs `*args` and `**kwargs` serves only compatibility
         # purpose and does not affect the result, we shouldn't pass them to the query compiler.
         return self.__constructor__(
             query_compiler=self._query_compiler.round(decimals=decimals, **kwargs)
         )
 
-    def rpow(self, other, axis="columns", level=None, fill_value=None):
+    def rpow(
+        self, other, axis="columns", level=None, fill_value=None
+    ):  # noqa: PR01, RT01, D200
+        """
+        Get exponential power of `BasePandasDataset` and `other`, element-wise (binary operator `rpow`).
+        """
         return self._binary_op(
             "rpow", other, axis=axis, level=level, fill_value=fill_value
         )
 
-    def rsub(self, other, axis="columns", level=None, fill_value=None):
+    def rsub(
+        self, other, axis="columns", level=None, fill_value=None
+    ):  # noqa: PR01, RT01, D200
+        """
+        Get subtraction of `BasePandasDataset` and `other`, element-wise (binary operator `rsub`).
+        """
         return self._binary_op(
             "rsub", other, axis=axis, level=level, fill_value=fill_value
         )
 
-    def rtruediv(self, other, axis="columns", level=None, fill_value=None):
+    def rtruediv(
+        self, other, axis="columns", level=None, fill_value=None
+    ):  # noqa: PR01, RT01, D200
+        """
+        Get floating division of `BasePandasDataset` and `other`, element-wise (binary operator `rtruediv`).
+        """
         return self._binary_op(
             "rtruediv", other, axis=axis, level=level, fill_value=fill_value
         )
@@ -2136,14 +2751,17 @@ class BasePandasDataset(object):
 
     def sample(
         self,
-        n=None,
-        frac=None,
-        replace=False,
+        n: int | None = None,
+        frac: float | None = None,
+        replace: bool = False,
         weights=None,
-        random_state=None,
-        axis=None,
-        ignore_index=False,
-    ):
+        random_state: RandomState | None = None,
+        axis: Axis | None = None,
+        ignore_index: bool = False,
+    ):  # noqa: PR01, RT01, D200
+        """
+        Return a random sample of items from an axis of object.
+        """
         axis = self._get_axis_number(axis)
         if axis:
             axis_labels = self.columns
@@ -2156,7 +2774,7 @@ class BasePandasDataset(object):
             # Index of the weights Series should correspond to the index of the
             # Dataframe in order to sample
             if isinstance(weights, BasePandasDataset):
-                weights = weights.reindex(self.axes[axis])
+                weights = weights.reindex(self._get_axis(axis))
             # If weights arg is a string, the weights used for sampling will
             # the be values in the column corresponding to that string
             if isinstance(weights, str):
@@ -2168,8 +2786,8 @@ class BasePandasDataset(object):
                 else:
                     raise ValueError(
                         "Strings can only be passed to "
-                        "weights when sampling from rows on "
-                        "a DataFrame"
+                        + "weights when sampling from rows on "
+                        + "a DataFrame"
                     )
             weights = pandas.Series(weights, dtype="float64")
 
@@ -2215,10 +2833,11 @@ class BasePandasDataset(object):
         if n == 0:
             # This returns an empty object, and since it is a weird edge case that
             # doesn't need to be distributed, we default to pandas for n=0.
+            # We don't need frac to be set to anything since n is already 0.
             return self._default_to_pandas(
                 "sample",
                 n=n,
-                frac=frac,
+                frac=None,
                 replace=replace,
                 weights=weights,
                 random_state=random_state,
@@ -2236,7 +2855,7 @@ class BasePandasDataset(object):
                 # random_state must be an int or a numpy RandomState object
                 raise ValueError(
                     "Please enter an `int` OR a "
-                    "np.random.RandomState for random_state"
+                    + "np.random.RandomState for random_state"
                 )
             # choose random numbers and then get corresponding labels from
             # chosen axis
@@ -2257,33 +2876,66 @@ class BasePandasDataset(object):
             return self.__constructor__(query_compiler=query_compiler)
 
     def sem(
-        self, axis=None, skipna=None, level=None, ddof=1, numeric_only=None, **kwargs
-    ):
+        self,
+        axis: Axis = 0,
+        skipna: bool = True,
+        ddof: int = 1,
+        numeric_only=False,
+        **kwargs,
+    ):  # noqa: PR01, RT01, D200
+        """
+        Return unbiased standard error of the mean over requested axis.
+        """
         return self._stat_operation(
-            "sem", axis, skipna, level, numeric_only, ddof=ddof, **kwargs
+            "sem", axis, skipna, numeric_only, ddof=ddof, **kwargs
         )
 
-    def set_axis(self, labels, axis=0, inplace=False):
-        if is_scalar(labels):
-            warnings.warn(
-                'set_axis now takes "labels" as first argument, and '
-                '"axis" as named parameter. The old form, with "axis" as '
-                'first parameter and "labels" as second, is still supported '
-                "but will be deprecated in a future version of pandas.",
-                FutureWarning,
-                stacklevel=2,
-            )
-            labels, axis = axis, labels
-        if inplace:
-            setattr(self, pandas.DataFrame()._get_axis_name(axis), labels)
-        else:
-            obj = self.copy()
-            obj.set_axis(labels, axis=axis, inplace=True)
-            return obj
+    def mean(
+        self,
+        axis: Axis = 0,
+        skipna=True,
+        numeric_only=False,
+        **kwargs,
+    ):  # noqa: PR01, RT01, D200
+        """
+        Return the mean of the values over the requested axis.
+        """
+        return self._stat_operation("mean", axis, skipna, numeric_only, **kwargs)
+
+    def median(
+        self,
+        axis: Axis = 0,
+        skipna=True,
+        numeric_only=False,
+        **kwargs,
+    ):  # noqa: PR01, RT01, D200
+        """
+        Return the mean of the values over the requested axis.
+        """
+        return self._stat_operation("median", axis, skipna, numeric_only, **kwargs)
+
+    def set_axis(
+        self,
+        labels,
+        *,
+        axis: Axis = 0,
+        copy=None,
+    ):  # noqa: PR01, RT01, D200
+        """
+        Assign desired index to given axis.
+        """
+        if copy is None:
+            copy = True
+        obj = self.copy() if copy else self
+        setattr(obj, pandas.DataFrame._get_axis_name(axis), labels)
+        return obj
 
     def set_flags(
         self, *, copy: bool = False, allows_duplicate_labels: Optional[bool] = None
-    ):
+    ):  # noqa: PR01, RT01, D200
+        """
+        Return a new `BasePandasDataset` with updated flags.
+        """
         return self._default_to_pandas(
             pandas.DataFrame.set_flags,
             copy=copy,
@@ -2292,95 +2944,61 @@ class BasePandasDataset(object):
 
     @property
     def flags(self):
-        def flags(df):
-            return df.flags
+        return self._default_to_pandas(lambda df: df.flags)
 
-        return self._default_to_pandas(flags)
+    def shift(
+        self,
+        periods: int = 1,
+        freq=None,
+        axis: Axis = 0,
+        fill_value: Hashable = lib.no_default,
+        suffix=None,
+    ):  # noqa: PR01, RT01, D200
+        """
+        Shift index by desired number of periods with an optional time `freq`.
+        """
+        if suffix:
+            return self._default_to_pandas(
+                lambda df: df.shift(
+                    periods=periods,
+                    freq=freq,
+                    axis=axis,
+                    fill_value=fill_value,
+                    suffix=suffix,
+                )
+            )
 
-    def shift(self, periods=1, freq=None, axis=0, fill_value=no_default):
+        if freq is not None and fill_value is not lib.no_default:
+            raise ValueError(
+                "Cannot pass both 'freq' and 'fill_value' to "
+                + f"{type(self).__name__}.shift"
+            )
+
         if periods == 0:
             # Check obvious case first
             return self.copy()
-
-        if fill_value is no_default:
-            nan_values = dict()
-            for name, dtype in dict(self.dtypes).items():
-                nan_values[name] = (
-                    pandas.NAT if is_datetime_or_timedelta_dtype(dtype) else pandas.NA
-                )
-
-            fill_value = nan_values
-
-        empty_frame = False
-        if axis == "index" or axis == 0:
-            if abs(periods) >= len(self.index):
-                fill_index = self.index
-                empty_frame = True
-            else:
-                fill_index = pandas.RangeIndex(start=0, stop=abs(periods), step=1)
-        else:
-            fill_index = self.index
-        from .dataframe import DataFrame
-
-        fill_columns = None
-        if isinstance(self, DataFrame):
-            if axis == "columns" or axis == 1:
-                if abs(periods) >= len(self.columns):
-                    fill_columns = self.columns
-                    empty_frame = True
-                else:
-                    fill_columns = pandas.RangeIndex(start=0, stop=abs(periods), step=1)
-            else:
-                fill_columns = self.columns
-
-        filled_df = (
-            self.__constructor__(index=fill_index, columns=fill_columns)
-            if isinstance(self, DataFrame)
-            else self.__constructor__(index=fill_index)
+        return self._create_or_update_from_compiler(
+            new_query_compiler=self._query_compiler.shift(
+                periods, freq, axis, fill_value
+            ),
+            inplace=False,
         )
-        if fill_value is not None:
-            filled_df.fillna(fill_value, inplace=True)
 
-        if empty_frame:
-            return filled_df
-
-        if freq is None:
-            if axis == "index" or axis == 0:
-                new_frame = (
-                    filled_df.append(self.iloc[:-periods], ignore_index=True)
-                    if periods > 0
-                    else self.iloc[-periods:].append(filled_df, ignore_index=True)
-                )
-                new_frame.index = self.index.copy()
-                if isinstance(self, DataFrame):
-                    new_frame.columns = self.columns.copy()
-                return new_frame
-            else:
-                if not isinstance(self, DataFrame):
-                    raise ValueError(
-                        f"No axis named {axis} for object type {type(self)}"
-                    )
-                res_columns = self.columns
-                from .general import concat
-
-                if periods > 0:
-                    dropped_df = self.drop(self.columns[-periods:], axis="columns")
-                    new_frame = concat([filled_df, dropped_df], axis="columns")
-                    new_frame.columns = res_columns
-                    return new_frame
-                else:
-                    dropped_df = self.drop(self.columns[:-periods], axis="columns")
-                    new_frame = concat([dropped_df, filled_df], axis="columns")
-                    new_frame.columns = res_columns
-                    return new_frame
-        else:
-            return self.tshift(periods, freq)
-
-    def skew(self, axis=None, skipna=None, level=None, numeric_only=None, **kwargs):
-        return self._stat_operation("skew", axis, skipna, level, numeric_only, **kwargs)
+    def skew(
+        self,
+        axis: Axis = 0,
+        skipna: bool = True,
+        numeric_only=False,
+        **kwargs,
+    ):  # noqa: PR01, RT01, D200
+        """
+        Return unbiased skew over requested axis.
+        """
+        return self._stat_operation("skew", axis, skipna, numeric_only, **kwargs)
 
     def sort_index(
         self,
+        *,
         axis=0,
         level=None,
         ascending=True,
@@ -2390,7 +3008,10 @@ class BasePandasDataset(object):
         sort_remaining=True,
         ignore_index: bool = False,
         key: Optional[IndexKeyFunc] = None,
-    ):
+    ):  # noqa: PR01, RT01, D200
+        """
+        Sort object by labels (along an axis).
+        """
         # pandas throws this exception. See pandas issie #39434
         if ascending is None:
             raise ValueError(
@@ -2414,6 +3035,7 @@ class BasePandasDataset(object):
     def sort_values(
         self,
         by,
+        *,
         axis=0,
         ascending=True,
         inplace: bool = False,
@@ -2421,9 +3043,13 @@ class BasePandasDataset(object):
         na_position="last",
         ignore_index: bool = False,
         key: Optional[IndexKeyFunc] = None,
-    ):
+    ):  # noqa: PR01, RT01, D200
+        """
+        Sort by the values along either axis.
+        """
         axis = self._get_axis_number(axis)
         inplace = validate_bool_kwarg(inplace, "inplace")
+        ascending = validate_ascending(ascending)
         if axis == 0:
             result = self._query_compiler.sort_rows_by_column_values(
                 by,
@@ -2445,20 +3071,38 @@ class BasePandasDataset(object):
         return self._create_or_update_from_compiler(result, inplace)
 
     def std(
-        self, axis=None, skipna=None, level=None, ddof=1, numeric_only=None, **kwargs
-    ):
+        self,
+        axis: Axis = 0,
+        skipna: bool = True,
+        ddof: int = 1,
+        numeric_only=False,
+        **kwargs,
+    ):  # noqa: PR01, RT01, D200
+        """
+        Return sample standard deviation over requested axis.
+        """
         return self._stat_operation(
-            "std", axis, skipna, level, numeric_only, ddof=ddof, **kwargs
+            "std", axis, skipna, numeric_only, ddof=ddof, **kwargs
         )
 
-    def sub(self, other, axis="columns", level=None, fill_value=None):
+    def sub(
+        self, other, axis="columns", level=None, fill_value=None
+    ):  # noqa: PR01, RT01, D200
+        """
+        Get subtraction of `BasePandasDataset` and `other`, element-wise (binary operator `sub`).
+        """
         return self._binary_op(
             "sub", other, axis=axis, level=level, fill_value=fill_value
         )
 
     subtract = sub
 
-    def swapaxes(self, axis1, axis2, copy=True):
+    def swapaxes(self, axis1, axis2, copy=None):  # noqa: PR01, RT01, D200
+        """
+        Interchange axes and swap values axes appropriately.
+        """
+        if copy is None:
+            copy = True
         axis1 = self._get_axis_number(axis1)
         axis2 = self._get_axis_number(axis2)
         if axis1 != axis2:
@@ -2467,25 +3111,39 @@ class BasePandasDataset(object):
             return self.copy()
         return self
 
-    def swaplevel(self, i=-2, j=-1, axis=0):
+    def swaplevel(self, i=-2, j=-1, axis=0):  # noqa: PR01, RT01, D200
+        """
+        Swap levels `i` and `j` in a `MultiIndex`.
+        """
         axis = self._get_axis_number(axis)
         idx = self.index if axis == 0 else self.columns
-        return self.set_axis(idx.swaplevel(i, j), axis=axis, inplace=False)
+        return self.set_axis(idx.swaplevel(i, j), axis=axis)
 
-    def tail(self, n=5):
+    def tail(self, n=5):  # noqa: PR01, RT01, D200
+        """
+        Return the last `n` rows.
+        """
         if n != 0:
             return self.iloc[-n:]
         return self.iloc[len(self.index) :]
 
-    def take(self, indices, axis=0, is_copy=None, **kwargs):
+    def take(self, indices, axis=0, **kwargs):  # noqa: PR01, RT01, D200
+        """
+        Return the elements in the given *positional* indices along an axis.
+        """
         axis = self._get_axis_number(axis)
         slice_obj = indices if axis == 0 else (slice(None), indices)
-        result = self.iloc[slice_obj]
-        return result if not is_copy else result.copy()
+        return self.iloc[slice_obj]
 
-    def to_clipboard(self, excel=True, sep=None, **kwargs):  # pragma: no cover
+    def to_clipboard(
+        self, excel=True, sep=None, **kwargs
+    ):  # pragma: no cover  # noqa: PR01, RT01, D200
+        """
+        Copy object to the system clipboard.
+        """
         return self._default_to_pandas("to_clipboard", excel=excel, sep=sep, **kwargs)
 
+    @expanduser_path_arg("path_or_buf")
     def to_csv(
         self,
         path_or_buf=None,
@@ -2501,7 +3159,7 @@ class BasePandasDataset(object):
         compression="infer",
         quoting=None,
         quotechar='"',
-        line_terminator=None,
+        lineterminator=None,
         chunksize=None,
         date_format=None,
         doublequote=True,
@@ -2510,41 +3168,36 @@ class BasePandasDataset(object):
         errors: str = "strict",
         storage_options: StorageOptions = None,
     ):  # pragma: no cover
-
-        kwargs = {
-            "path_or_buf": path_or_buf,
-            "sep": sep,
-            "na_rep": na_rep,
-            "float_format": float_format,
-            "columns": columns,
-            "header": header,
-            "index": index,
-            "index_label": index_label,
-            "mode": mode,
-            "encoding": encoding,
-            "compression": compression,
-            "quoting": quoting,
-            "quotechar": quotechar,
-            "line_terminator": line_terminator,
-            "chunksize": chunksize,
-            "date_format": date_format,
-            "doublequote": doublequote,
-            "escapechar": escapechar,
-            "decimal": decimal,
-            "errors": errors,
-            "storage_options": storage_options,
-        }
-        new_query_compiler = self._query_compiler
-
         from modin.core.execution.dispatching.factories.dispatcher import (
             FactoryDispatcher,
         )
 
-        return FactoryDispatcher.to_csv(new_query_compiler, **kwargs)
+        return FactoryDispatcher.to_csv(
+            self._query_compiler,
+            path_or_buf=path_or_buf,
+            sep=sep,
+            na_rep=na_rep,
+            float_format=float_format,
+            columns=columns,
+            header=header,
+            index=index,
+            index_label=index_label,
+            mode=mode,
+            encoding=encoding,
+            compression=compression,
+            quoting=quoting,
+            quotechar=quotechar,
+            lineterminator=lineterminator,
+            chunksize=chunksize,
+            date_format=date_format,
+            doublequote=doublequote,
+            escapechar=escapechar,
+            decimal=decimal,
+            errors=errors,
+            storage_options=storage_options,
+        )
 
-    def to_dict(self, orient="dict", into=dict):  # pragma: no cover
-        return self._default_to_pandas("to_dict", orient=orient, into=into)
-
+    @expanduser_path_arg("excel_writer")
     def to_excel(
         self,
         excel_writer,
@@ -2559,12 +3212,14 @@ class BasePandasDataset(object):
         startcol=0,
         engine=None,
         merge_cells=True,
-        encoding=None,
         inf_rep="inf",
-        verbose=True,
         freeze_panes=None,
         storage_options: StorageOptions = None,
-    ):  # pragma: no cover
+        engine_kwargs=None,
+    ):  # pragma: no cover  # noqa: PR01, RT01, D200
+        """
+        Write object to an Excel sheet.
+        """
         return self._default_to_pandas(
             "to_excel",
             excel_writer,
@@ -2579,18 +3234,55 @@ class BasePandasDataset(object):
             startcol=startcol,
             engine=engine,
             merge_cells=merge_cells,
-            encoding=encoding,
             inf_rep=inf_rep,
-            verbose=verbose,
             freeze_panes=freeze_panes,
             storage_options=storage_options,
+            engine_kwargs=engine_kwargs,
         )
 
-    def to_hdf(self, path_or_buf, key, format="table", **kwargs):  # pragma: no cover
+    def to_dict(self, orient="dict", into=dict, index=True):
+        return self._query_compiler.dataframe_to_dict(orient, into, index)
+
+    @expanduser_path_arg("path_or_buf")
+    def to_hdf(
+        self,
+        path_or_buf,
+        key: str,
+        mode: Literal["a", "w", "r+"] = "a",
+        complevel: int | None = None,
+        complib: Literal["zlib", "lzo", "bzip2", "blosc"] | None = None,
+        append: bool = False,
+        format: Literal["fixed", "table"] | None = None,
+        index: bool = True,
+        min_itemsize: int | dict[str, int] | None = None,
+        nan_rep=None,
+        dropna: bool | None = None,
+        data_columns: Literal[True] | list[str] | None = None,
+        errors: str = "strict",
+        encoding: str = "UTF-8",
+    ) -> None:  # pragma: no cover  # noqa: PR01, RT01, D200
+        """
+        Write the contained data to an HDF5 file using HDFStore.
+        """
         return self._default_to_pandas(
-            "to_hdf", path_or_buf, key, format=format, **kwargs
+            "to_hdf",
+            path_or_buf,
+            key=key,
+            mode=mode,
+            complevel=complevel,
+            complib=complib,
+            append=append,
+            format=format,
+            index=index,
+            min_itemsize=min_itemsize,
+            nan_rep=nan_rep,
+            dropna=dropna,
+            data_columns=data_columns,
+            errors=errors,
+            encoding=encoding,
         )
 
+    @expanduser_path_arg("path_or_buf")
     def to_json(
         self,
         path_or_buf=None,
@@ -2602,12 +3294,20 @@ class BasePandasDataset(object):
         default_handler=None,
         lines=False,
         compression="infer",
-        index=True,
+        index=None,
         indent=None,
         storage_options: StorageOptions = None,
-    ):  # pragma: no cover
-        return self._default_to_pandas(
-            "to_json",
+        mode="w",
+    ):  # pragma: no cover  # noqa: PR01, RT01, D200
+        """
+        Convert the object to a JSON string.
+        """
+        from modin.core.execution.dispatching.factories.dispatcher import (
+            FactoryDispatcher,
+        )
+
+        return FactoryDispatcher.to_json(
+            self._query_compiler,
             path_or_buf,
             orient=orient,
             date_format=date_format,
@@ -2620,13 +3320,14 @@ class BasePandasDataset(object):
             index=index,
             indent=indent,
             storage_options=storage_options,
+            mode=mode,
         )
 
+    @expanduser_path_arg("buf")
     def to_latex(
         self,
         buf=None,
         columns=None,
-        col_space=None,
         header=True,
         index=True,
         na_rep="NaN",
@@ -2646,12 +3347,14 @@ class BasePandasDataset(object):
         caption=None,
         label=None,
         position=None,
-    ):  # pragma: no cover
+    ):  # pragma: no cover  # noqa: PR01, RT01, D200
+        """
+        Render object to a LaTeX tabular, longtable, or nested table.
+        """
         return self._default_to_pandas(
             "to_latex",
             buf=buf,
             columns=columns,
-            col_space=col_space,
             header=header,
             index=index,
             na_rep=na_rep,
@@ -2668,10 +3371,12 @@ class BasePandasDataset(object):
             multicolumn=multicolumn,
             multicolumn_format=multicolumn_format,
             multirow=multirow,
-            caption=None,
-            label=None,
+            caption=caption,
+            label=label,
+            position=position,
         )
 
+    @expanduser_path_arg("buf")
     def to_markdown(
         self,
         buf=None,
@@ -2679,7 +3384,10 @@ class BasePandasDataset(object):
         index: bool = True,
         storage_options: StorageOptions = None,
         **kwargs,
-    ):
+    ):  # noqa: PR01, RT01, D200
+        """
+        Print `BasePandasDataset` in Markdown-friendly format.
+        """
         return self._default_to_pandas(
             "to_markdown",
             buf=buf,
@@ -2689,25 +3397,18 @@ class BasePandasDataset(object):
             **kwargs,
         )
 
-    def to_numpy(self, dtype=None, copy=False, na_value=no_default):
-        return self._query_compiler.to_numpy(
-            dtype=dtype,
-            copy=copy,
-            na_value=na_value,
-        )
-
-    # TODO(williamma12): When this gets implemented, have the series one call this.
-    def to_period(self, freq=None, axis=0, copy=True):  # pragma: no cover
-        return self._default_to_pandas("to_period", freq=freq, axis=axis, copy=copy)
-
+    @expanduser_path_arg("path")
     def to_pickle(
         self,
-        path: FilePathOrBuffer,
+        path,
         compression: CompressionOptions = "infer",
         protocol: int = pkl.HIGHEST_PROTOCOL,
         storage_options: StorageOptions = None,
-    ):  # pragma: no cover
-        from modin.pandas.io import to_pickle
+    ):  # pragma: no cover  # noqa: PR01, D200
+        """
+        Pickle (serialize) object to file.
+        """
+        from modin.pandas import to_pickle
 
         to_pickle(
             self,
@@ -2717,6 +3418,47 @@ class BasePandasDataset(object):
             storage_options=storage_options,
         )
 
+    def _to_bare_numpy(
+        self, dtype=None, copy=False, na_value=lib.no_default
+    ):  # noqa: PR01, RT01, D200
+        """
+        Convert the `BasePandasDataset` to a NumPy array.
+        """
+        return self._query_compiler.to_numpy(
+            dtype=dtype,
+            copy=copy,
+            na_value=na_value,
+        )
+
+    def to_numpy(
+        self, dtype=None, copy=False, na_value=lib.no_default
+    ):  # noqa: PR01, RT01, D200
+        """
+        Convert the `BasePandasDataset` to a NumPy array or a Modin wrapper for NumPy array.
+        """
+        from modin.config import ModinNumpy
+
+        if ModinNumpy.get():
+            from ..numpy.arr import array
+
+            return array(self, copy=copy)
+
+        return self._to_bare_numpy(
+            dtype=dtype,
+            copy=copy,
+            na_value=na_value,
+        )
+
+    # TODO(williamma12): When this gets implemented, have the series one call this.
+    def to_period(
+        self, freq=None, axis=0, copy=None
+    ):  # pragma: no cover  # noqa: PR01, RT01, D200
+        """
+        Convert `BasePandasDataset` from DatetimeIndex to PeriodIndex.
+        """
+        return self._default_to_pandas("to_period", freq=freq, axis=axis, copy=copy)
+
+    @expanduser_path_arg("buf")
     def to_string(
         self,
         buf=None,
@@ -2738,7 +3480,10 @@ class BasePandasDataset(object):
         line_width=None,
         max_colwidth=None,
         encoding=None,
-    ):
+    ):  # noqa: PR01, RT01, D200
+        """
+        Render a `BasePandasDataset` to a console-friendly tabular output.
+        """
         return self._default_to_pandas(
             "to_string",
             buf=buf,
@@ -2772,13 +3517,20 @@ class BasePandasDataset(object):
         chunksize=None,
         dtype=None,
         method=None,
-    ):
+    ):  # noqa: PR01, D200
+        """
+        Write records stored in a `BasePandasDataset` to a SQL database.
+        """
         new_query_compiler = self._query_compiler
         # writing the index to the database by inserting it to the DF
         if index:
-            if not index_label:
-                index_label = "index"
-            new_query_compiler = new_query_compiler.insert(0, index_label, self.index)
+            new_query_compiler = new_query_compiler.reset_index()
+            if index_label is not None:
+                if not is_list_like(index_label):
+                    index_label = [index_label]
+                new_query_compiler.columns = list(index_label) + list(
+                    new_query_compiler.columns[len(index_label) :]
+                )
             # so pandas._to_sql will not write the index to the database as well
             index = False
 
@@ -2800,80 +3552,141 @@ class BasePandasDataset(object):
         )
 
     # TODO(williamma12): When this gets implemented, have the series one call this.
-    def to_timestamp(self, freq=None, how="start", axis=0, copy=True):
+    def to_timestamp(
+        self, freq=None, how="start", axis=0, copy=None
+    ):  # noqa: PR01, RT01, D200
+        """
+        Cast to DatetimeIndex of timestamps, at *beginning* of period.
+        """
         return self._default_to_pandas(
             "to_timestamp", freq=freq, how=how, axis=axis, copy=copy
         )
 
-    def to_xarray(self):
+    def to_xarray(self):  # noqa: PR01, RT01, D200
+        """
+        Return an xarray object from the `BasePandasDataset`.
+        """
         return self._default_to_pandas("to_xarray")
 
-    def truediv(self, other, axis="columns", level=None, fill_value=None):
+    def truediv(
+        self, other, axis="columns", level=None, fill_value=None
+    ):  # noqa: PR01, RT01, D200
+        """
+        Get floating division of `BasePandasDataset` and `other`, element-wise (binary operator `truediv`).
+        """
         return self._binary_op(
             "truediv", other, axis=axis, level=level, fill_value=fill_value
         )
 
     div = divide = truediv
 
-    def truncate(self, before=None, after=None, axis=None, copy=True):
+    def truncate(
+        self, before=None, after=None, axis=None, copy=None
+    ):  # noqa: PR01, RT01, D200
+        """
+        Truncate a `BasePandasDataset` before and after some index value.
+        """
         axis = self._get_axis_number(axis)
         if (
-            not self.axes[axis].is_monotonic_increasing
-            and not self.axes[axis].is_monotonic_decreasing
+            not self._get_axis(axis).is_monotonic_increasing
+            and not self._get_axis(axis).is_monotonic_decreasing
         ):
             raise ValueError("truncate requires a sorted index")
-        s = slice(*self.axes[axis].slice_locs(before, after))
+
+        if before is not None and after is not None and before > after:
+            raise ValueError(f"Truncate: {after} must be after {before}")
+
+        s = slice(*self._get_axis(axis).slice_locs(before, after))
         slice_obj = s if axis == 0 else (slice(None), s)
         return self.iloc[slice_obj]
 
-    def tshift(self, periods=1, freq=None, axis=0):
-        axis = self._get_axis_number(axis)
-        new_labels = self.axes[axis].shift(periods, freq=freq)
-        return self.set_axis(new_labels, axis=axis, inplace=False)
-
-    def transform(self, func, axis=0, *args, **kwargs):
+    def transform(self, func, axis=0, *args, **kwargs):  # noqa: PR01, RT01, D200
+        """
+        Call ``func`` on self producing a `BasePandasDataset` with the same axis shape as self.
+        """
         kwargs["is_transform"] = True
         self._validate_function(func)
         try:
             result = self.agg(func, axis=axis, *args, **kwargs)
-        except TypeError:
+        except (TypeError, pandas.errors.SpecificationError):
             raise
         except Exception as err:
             raise ValueError("Transform function failed") from err
-        try:
-            assert len(result) == len(self)
-        except Exception:
-            raise ValueError("transforms cannot produce aggregated results")
+        if getattr(result, "_pandas_class", None) not in (
+            pandas.Series,
+            pandas.DataFrame,
+        ) or not result.index.equals(self.index):
+            raise ValueError("Function did not transform")
         return result
 
-    def tz_convert(self, tz, axis=0, level=None, copy=True):
-        axis = self._get_axis_number(axis)
-        if level is not None:
-            new_labels = (
-                pandas.Series(index=self.axes[axis]).tz_convert(tz, level=level).index
-            )
-        else:
-            new_labels = self.axes[axis].tz_convert(tz)
-        obj = self.copy() if copy else self
-        return obj.set_axis(new_labels, axis, inplace=not copy)
+    def tz_convert(self, tz, axis=0, level=None, copy=None):  # noqa: PR01, RT01, D200
+        """
+        Convert tz-aware axis to target time zone.
+        """
+        if copy is None:
+            copy = True
+        return self._create_or_update_from_compiler(
+            self._query_compiler.tz_convert(
+                tz, axis=self._get_axis_number(axis), level=level, copy=copy
+            ),
+            inplace=(not copy),
+        )
 
     def tz_localize(
-        self, tz, axis=0, level=None, copy=True, ambiguous="raise", nonexistent="raise"
-    ):
-        axis = self._get_axis_number(axis)
-        new_labels = (
-            pandas.Series(index=self.axes[axis])
-            .tz_localize(
+        self, tz, axis=0, level=None, copy=None, ambiguous="raise", nonexistent="raise"
+    ):  # noqa: PR01, RT01, D200
+        """
+        Localize tz-naive index of a `BasePandasDataset` to target time zone.
+        """
+        if copy is None:
+            copy = True
+        return self._create_or_update_from_compiler(
+            self._query_compiler.tz_localize(
                 tz,
-                axis=axis,
+                axis=self._get_axis_number(axis),
                 level=level,
-                copy=False,
+                copy=copy,
                 ambiguous=ambiguous,
                 nonexistent=nonexistent,
-            )
-            .index
+            ),
+            inplace=(not copy),
         )
-        return self.set_axis(labels=new_labels, axis=axis, inplace=not copy)
+
+    def interpolate(
+        self,
+        method="linear",
+        *,
+        axis=0,
+        limit=None,
+        inplace=False,
+        limit_direction: Optional[str] = None,
+        limit_area=None,
+        downcast=lib.no_default,
+        **kwargs,
+    ):  # noqa: PR01, RT01, D200
+        if downcast is not lib.no_default:
+            warnings.warn(
+                f"The 'downcast' keyword in {type(self).__name__}.interpolate "
+                + "is deprecated and will be removed in a future version. "
+                + "Call result.infer_objects(copy=False) on the result instead.",
+                FutureWarning,
+            )
+        else:
+            downcast = None
+
+        return self._create_or_update_from_compiler(
+            self._query_compiler.interpolate(
+                method=method,
+                axis=axis,
+                limit=limit,
+                inplace=False,
+                limit_direction=limit_direction,
+                limit_area=limit_area,
+                downcast=downcast,
+                **kwargs,
+            ),
+            inplace=inplace,
+        )
 
     # TODO: uncomment the following lines when #3331 issue will be closed
     # @prepend_to_notes(
@@ -2883,10 +3696,12 @@ class BasePandasDataset(object):
     #     Series's index will be a regular single dimensional ``Index``.
     #     """
     # )
-    # @_inherit_docstrings(pandas.DataFrame.value_counts, apilink="pandas.DataFrame.value_counts")
+    @_inherit_docstrings(
+        pandas.DataFrame.value_counts, apilink="pandas.DataFrame.value_counts"
+    )
     def value_counts(
         self,
-        subset: Sequence[Hashable] = None,
+        subset: Sequence[Hashable] | None = None,
         normalize: bool = False,
         sort: bool = True,
         ascending: bool = False,
@@ -2894,7 +3709,15 @@ class BasePandasDataset(object):
     ):
         if subset is None:
             subset = self._query_compiler.columns
-        counted_values = self.groupby(by=subset, dropna=dropna, observed=True).size()
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=".*groupby keys will be sorted anyway.*",
+                category=UserWarning,
+            )
+            counted_values = self.groupby(
+                by=subset, dropna=dropna, observed=True, sort=False
+            ).size()
         if sort:
             counted_values.sort_values(ascending=ascending, inplace=True)
         if normalize:
@@ -2905,66 +3728,244 @@ class BasePandasDataset(object):
         #     counted_values.index = pandas.MultiIndex.from_arrays(
         #         [counted_values.index], names=counted_values.index.names
         #     )
+        # https://pandas.pydata.org/pandas-docs/version/2.0/whatsnew/v2.0.0.html#value-counts-sets-the-resulting-name-to-count
+        counted_values.name = "proportion" if normalize else "count"
         return counted_values
 
     def var(
-        self, axis=None, skipna=None, level=None, ddof=1, numeric_only=None, **kwargs
-    ):
+        self,
+        axis: Axis = 0,
+        skipna: bool = True,
+        ddof: int = 1,
+        numeric_only=False,
+        **kwargs,
+    ):  # noqa: PR01, RT01, D200
+        """
+        Return unbiased variance over requested axis.
+        """
         return self._stat_operation(
-            "var", axis, skipna, level, numeric_only, ddof=ddof, **kwargs
+            "var", axis, skipna, numeric_only, ddof=ddof, **kwargs
         )
 
     def __abs__(self):
+        """
+        Return a `BasePandasDataset` with absolute numeric value of each element.
+
+        Returns
+        -------
+        BasePandasDataset
+            Object containing the absolute value of each element.
+        """
         return self.abs()
 
+    @_doc_binary_op(
+        operation="union", bin_op="and", right="other", **_doc_binary_op_kwargs
+    )
     def __and__(self, other):
         return self._binary_op("__and__", other, axis=0)
 
+    @_doc_binary_op(
+        operation="union", bin_op="rand", right="other", **_doc_binary_op_kwargs
+    )
     def __rand__(self, other):
         return self._binary_op("__rand__", other, axis=0)
 
     def __array__(self, dtype=None):
-        arr = self.to_numpy(dtype)
-        return arr
+        """
+        Return the values as a NumPy array.
 
-    def __array_wrap__(self, result, context=None):
-        # TODO: This is very inefficient. __array__ and as_matrix have been
-        # changed to call the more efficient to_numpy, but this has been left
-        # unchanged since we are not sure of its purpose.
-        return self._default_to_pandas("__array_wrap__", result, context=context)
+        Parameters
+        ----------
+        dtype : str or np.dtype, optional
+            The dtype of returned array.
+
+        Returns
+        -------
+        arr : np.ndarray
+            NumPy representation of Modin object.
+        """
+        return self._to_bare_numpy(dtype)
 
     def __copy__(self, deep=True):
+        """
+        Return the copy of the `BasePandasDataset`.
+
+        Parameters
+        ----------
+        deep : bool, default: True
+            Whether the copy should be deep or not.
+
+        Returns
+        -------
+        BasePandasDataset
+        """
         return self.copy(deep=deep)
 
     def __deepcopy__(self, memo=None):
+        """
+        Return the deep copy of the `BasePandasDataset`.
+
+        Parameters
+        ----------
+        memo : Any, optional
+           Deprecated parameter.
+
+        Returns
+        -------
+        BasePandasDataset
+        """
         return self.copy(deep=True)
 
+    @_doc_binary_op(
+        operation="equality comparison",
+        bin_op="eq",
+        right="other",
+        **_doc_binary_op_kwargs,
+    )
     def __eq__(self, other):
         return self.eq(other)
 
     def __finalize__(self, other, method=None, **kwargs):
+        """
+        Propagate metadata from `other` to `self`.
+
+        Parameters
+        ----------
+        other : BasePandasDataset
+            The object from which to get the attributes that we are going
+            to propagate.
+        method : str, optional
+            A passed method name providing context on where `__finalize__`
+            was called.
+        **kwargs : dict
+            Additional keywords arguments to be passed to `__finalize__`.
+
+        Returns
+        -------
+        BasePandasDataset
+        """
         return self._default_to_pandas("__finalize__", other, method=method, **kwargs)
 
+    @_doc_binary_op(
+        operation="greater than or equal comparison",
+        bin_op="ge",
+        right="right",
+        **_doc_binary_op_kwargs,
+    )
     def __ge__(self, right):
         return self.ge(right)
 
     def __getitem__(self, key):
+        """
+        Retrieve dataset according to `key`.
+
+        Parameters
+        ----------
+        key : callable, scalar, slice, str or tuple
+            The global row index to retrieve data from.
+
+        Returns
+        -------
+        BasePandasDataset
+            Located dataset.
+        """
         if not self._query_compiler.lazy_execution and len(self) == 0:
             return self._default_to_pandas("__getitem__", key)
         # see if we can slice the rows
         # This lets us reuse code in pandas to error check
         indexer = None
-        if isinstance(key, slice) or (
-            isinstance(key, str)
-            and (not hasattr(self, "columns") or key not in self.columns)
-        ):
-            indexer = convert_to_index_sliceable(
-                pandas.DataFrame(index=self.index), key
-            )
+        if isinstance(key, slice):
+            indexer = self.index._convert_slice_indexer(key, kind="getitem")
         if indexer is not None:
             return self._getitem_slice(indexer)
         else:
             return self._getitem(key)
+
+    def xs(
+        self,
+        key,
+        axis=0,
+        level=None,
+        drop_level: bool = True,
+    ):  # noqa: PR01, RT01, D200
+        """
+        Return cross-section from the Series/DataFrame.
+        """
+        axis = self._get_axis_number(axis)
+        labels = self.columns if axis else self.index
+
+        if isinstance(key, list):
+            # deprecated in pandas, to be removed in 2.0
+            warnings.warn(
+                "Passing lists as key for xs is deprecated and will be removed in a "
+                + "future version. Pass key as a tuple instead.",
+                FutureWarning,
+            )
+
+        if level is not None:
+            if not isinstance(labels, pandas.MultiIndex):
+                raise TypeError("Index must be a MultiIndex")
+            loc, new_ax = labels.get_loc_level(key, level=level, drop_level=drop_level)
+
+            # create the tuple of the indexer
+            _indexer = [slice(None)] * self.ndim
+            _indexer[axis] = loc
+            indexer = tuple(_indexer)
+
+            result = self.iloc[indexer]
+            setattr(result, self._pandas_class._get_axis_name(axis), new_ax)
+            return result
+
+        if axis == 1:
+            if drop_level:
+                return self[key]
+            index = self.columns
+        else:
+            index = self.index
+
+        new_index = None
+        if isinstance(index, pandas.MultiIndex):
+            loc, new_index = index._get_loc_level(key, level=0)
+            if not drop_level:
+                if is_integer(loc):
+                    new_index = index[loc : loc + 1]
+                else:
+                    new_index = index[loc]
+        else:
+            loc = index.get_loc(key)
+
+            if isinstance(loc, np.ndarray):
+                if loc.dtype == np.bool_:
+                    (loc,) = loc.nonzero()
+                # Note: pandas uses self._take_with_is_copy here
+                return self.take(loc, axis=axis)
+
+            if not is_scalar(loc):
+                new_index = index[loc]
+
+        if is_scalar(loc) and axis == 0:
+            # In this case loc should be an integer
+            if self.ndim == 1:
+                # if we encounter an array-like and we only have 1 dim
+                # that means that their are list/ndarrays inside the Series!
+                # so just return them (pandas GH 6394)
+                return self.iloc[loc]
+
+            result = self.iloc[loc]
+        elif is_scalar(loc):
+            result = self.iloc[:, slice(loc, loc + 1)]
+        elif axis == 1:
+            result = self.iloc[:, loc]
+        else:
+            result = self.iloc[loc]
+            if new_index is None:
+                raise RuntimeError(
+                    "`new_index` variable shouldn't be equal to None here, something went wrong."
+                )
+            result.index = new_index
+
+        # Note: pandas does result._set_is_copy here
+        return result
 
     __hash__ = None
 
@@ -2979,7 +3980,7 @@ class BasePandasDataset(object):
         value : object
             Value to assing to the rows.
         """
-        indexer = convert_to_index_sliceable(pandas.DataFrame(index=self.index), key)
+        indexer = self.index._convert_slice_indexer(key, kind="getitem")
         self.iloc[indexer] = value
 
     def _getitem_slice(self, key: slice):
@@ -2996,78 +3997,234 @@ class BasePandasDataset(object):
         modin.pandas.BasePandasDataset
             Selected rows.
         """
-        if key.start is None and key.stop is None:
+        if is_full_grab_slice(
+            key,
+            # Avoid triggering shape computation for lazy executions
+            sequence_len=(None if self._query_compiler.lazy_execution else len(self)),
+        ):
             return self.copy()
         return self.iloc[key]
 
+    @_doc_binary_op(
+        operation="greater than comparison",
+        bin_op="gt",
+        right="right",
+        **_doc_binary_op_kwargs,
+    )
     def __gt__(self, right):
         return self.gt(right)
 
     def __invert__(self):
-        if not all(is_numeric_dtype(d) for d in self._get_dtypes()):
+        """
+        Apply bitwise inverse to each element of the `BasePandasDataset`.
+
+        Returns
+        -------
+        BasePandasDataset
+            New BasePandasDataset containing bitwise inverse to each value.
+        """
+        if not all(is_bool_dtype(d) or is_integer_dtype(d) for d in self._get_dtypes()):
             raise TypeError(
                 "bad operand type for unary ~: '{}'".format(
-                    next(d for d in self._get_dtypes() if not is_numeric_dtype(d))
+                    next(
+                        d
+                        for d in self._get_dtypes()
+                        if not (is_bool_dtype(d) or is_integer_dtype(d))
+                    )
                 )
             )
         return self.__constructor__(query_compiler=self._query_compiler.invert())
 
+    @_doc_binary_op(
+        operation="less than or equal comparison",
+        bin_op="le",
+        right="right",
+        **_doc_binary_op_kwargs,
+    )
     def __le__(self, right):
         return self.le(right)
 
     def __len__(self):
+        """
+        Return length of info axis.
+
+        Returns
+        -------
+        int
+        """
         return len(self.index)
 
+    @_doc_binary_op(
+        operation="less than comparison",
+        bin_op="lt",
+        right="right",
+        **_doc_binary_op_kwargs,
+    )
     def __lt__(self, right):
         return self.lt(right)
 
     def __matmul__(self, other):
+        """
+        Compute the matrix multiplication between the `BasePandasDataset` and `other`.
+
+        Parameters
+        ----------
+        other : BasePandasDataset or array-like
+            The other object to compute the matrix product with.
+
+        Returns
+        -------
+        BasePandasDataset, np.ndarray or scalar
+        """
         return self.dot(other)
 
+    @_doc_binary_op(
+        operation="not equal comparison",
+        bin_op="ne",
+        right="other",
+        **_doc_binary_op_kwargs,
+    )
     def __ne__(self, other):
         return self.ne(other)
 
     def __neg__(self):
+        """
+        Change the sign for every value of self.
+
+        Returns
+        -------
+        BasePandasDataset
+        """
         self._validate_dtypes(numeric_only=True)
         return self.__constructor__(query_compiler=self._query_compiler.negative())
 
     def __nonzero__(self):
+        """
+        Evaluate `BasePandasDataset` as boolean object.
+
+        Raises
+        ------
+        ValueError
+            Always since truth value for self is ambiguous.
+        """
         raise ValueError(
-            "The truth value of a {0} is ambiguous. "
-            "Use a.empty, a.bool(), a.item(), a.any() or a.all().".format(
-                self.__class__.__name__
-            )
+            f"The truth value of a {self.__class__.__name__} is ambiguous. "
+            + "Use a.empty, a.bool(), a.item(), a.any() or a.all()."
         )
 
     __bool__ = __nonzero__
 
+    @_doc_binary_op(
+        operation="disjunction",
+        bin_op="or",
+        right="other",
+        **_doc_binary_op_kwargs,
+    )
     def __or__(self, other):
         return self._binary_op("__or__", other, axis=0)
 
+    @_doc_binary_op(
+        operation="disjunction",
+        bin_op="ror",
+        right="other",
+        **_doc_binary_op_kwargs,
+    )
     def __ror__(self, other):
         return self._binary_op("__ror__", other, axis=0)
 
     def __sizeof__(self):
-        return self._default_to_pandas("__sizeof__")
+        """
+        Generate the total memory usage for an `BasePandasDataset`.
+
+        Returns
+        -------
+        int
+        """
+        return self._query_compiler.sizeof()
 
     def __str__(self):  # pragma: no cover
+        """
+        Return str(self).
+
+        Returns
+        -------
+        str
+        """
         return repr(self)
 
+    @_doc_binary_op(
+        operation="exclusive disjunction",
+        bin_op="xor",
+        right="other",
+        **_doc_binary_op_kwargs,
+    )
     def __xor__(self, other):
         return self._binary_op("__xor__", other, axis=0)
 
+    @_doc_binary_op(
+        operation="exclusive disjunction",
+        bin_op="rxor",
+        right="other",
+        **_doc_binary_op_kwargs,
+    )
     def __rxor__(self, other):
         return self._binary_op("__rxor__", other, axis=0)
 
     @property
-    def size(self):
+    def size(self):  # noqa: RT01, D200
+        """
+        Return an int representing the number of elements in this `BasePandasDataset` object.
+        """
         return len(self._query_compiler.index) * len(self._query_compiler.columns)
 
     @property
-    def values(self):
+    def values(self):  # noqa: RT01, D200
+        """
+        Return a NumPy representation of the `BasePandasDataset`.
+        """
         return self.to_numpy()
 
+    def _repartition(self, axis: Optional[int] = None):
+        """
+        Repartitioning Modin objects to get ideal partitions inside.
+
+        Allows to improve performance where the query compiler can't improve
+        yet by doing implicit repartitioning.
+
+        Parameters
+        ----------
+        axis : {0, 1, None}, optional
+            The axis along which the repartitioning occurs.
+            `None` is used for repartitioning along both axes.
+
+        Returns
+        -------
+        DataFrame or Series
+            The repartitioned dataframe or series, depending on the original type.
+        """
+        allowed_axis_values = (0, 1, None)
+        if axis not in allowed_axis_values:
+            raise ValueError(
+                f"Passed `axis` parameter: {axis}, but should be one of {allowed_axis_values}"
+            )
+        return self.__constructor__(
+            query_compiler=self._query_compiler.repartition(axis=axis)
+        )
+
+    @disable_logging
     def __getattribute__(self, item):
+        """
+        Return item from the `BasePandasDataset`.
+
+        Parameters
+        ----------
+        item : hashable
+            Item to get.
+
+        Returns
+        -------
+        Any
+        """
         attr = super().__getattribute__(item)
         if item not in _DEFAULT_BEHAVIOUR and not self._query_compiler.lazy_execution:
             # We default to pandas on empty DataFrames. This avoids a large amount of
@@ -3081,657 +4238,54 @@ class BasePandasDataset(object):
                 return default_handler
         return attr
 
-
-if IsExperimental.get():
-    from modin.experimental.cloud.meta_magic import make_wrapped_class
-
-    make_wrapped_class(BasePandasDataset, "make_base_dataset_wrapper")
-
-
-@_inherit_docstrings(pandas.core.resample.Resampler)
-class Resampler(object):
-    def __init__(
-        self,
-        dataframe,
-        rule,
-        axis=0,
-        closed=None,
-        label=None,
-        convention="start",
-        kind=None,
-        loffset=None,
-        base=0,
-        on=None,
-        level=None,
-        origin: Union[str, TimestampConvertibleTypes] = "start_day",
-        offset: Optional[TimedeltaConvertibleTypes] = None,
+    def __array_ufunc__(
+        self, ufunc: np.ufunc, method: str, *inputs: Any, **kwargs: Any
     ):
-        self._dataframe = dataframe
-        self._query_compiler = dataframe._query_compiler
-        axis = self._dataframe._get_axis_number(axis)
-        self.resample_kwargs = {
-            "rule": rule,
-            "axis": axis,
-            "closed": closed,
-            "label": label,
-            "convention": convention,
-            "kind": kind,
-            "loffset": loffset,
-            "base": base,
-            "on": on,
-            "level": level,
-            "origin": origin,
-            "offset": offset,
-        }
-        self.__groups = self.__get_groups(**self.resample_kwargs)
-
-    def __getitem__(self, key):
         """
-        Get ``Resampler`` based on `key` columns of original dataframe.
+        Apply the `ufunc` to the `BasePandasDataset`.
 
         Parameters
         ----------
-        key : str or list
-            String or list of selections.
+        ufunc : np.ufunc
+            The NumPy ufunc to apply.
+        method : str
+            The method to apply.
+        *inputs : tuple
+            The inputs to the ufunc.
+        **kwargs : dict
+            Additional keyword arguments.
 
         Returns
         -------
-        modin.pandas.BasePandasDataset
-            New ``Resampler`` based on `key` columns subset
-            of the original dataframe.
+        BasePandasDataset
+            The result of the ufunc applied to the `BasePandasDataset`.
         """
-
-        def _get_new_resampler(key):
-            subset = self._dataframe[key]
-            resampler = type(self)(subset, **self.resample_kwargs)
-            return resampler
-
-        from .series import Series
-
-        if isinstance(
-            key, (list, tuple, Series, pandas.Series, pandas.Index, np.ndarray)
-        ):
-            if len(self._dataframe.columns.intersection(key)) != len(key):
-                missed_keys = list(set(key).difference(self._dataframe.columns))
-                raise KeyError(f"Columns not found: {str(sorted(missed_keys))[1:-1]}")
-            return _get_new_resampler(list(key))
-
-        if key not in self._dataframe:
-            raise KeyError(f"Column not found: {key}")
-
-        return _get_new_resampler(key)
-
-    def __get_groups(
-        self,
-        rule,
-        axis,
-        closed,
-        label,
-        convention,
-        kind,
-        loffset,
-        base,
-        on,
-        level,
-        origin,
-        offset,
-    ):
-        if axis == 0:
-            df = self._dataframe
-        else:
-            df = self._dataframe.T
-        groups = df.groupby(
-            pandas.Grouper(
-                key=on,
-                freq=rule,
-                closed=closed,
-                label=label,
-                convention=convention,
-                loffset=loffset,
-                base=base,
-                level=level,
-                origin=origin,
-                offset=offset,
-            )
-        )
-        return groups
-
-    @property
-    def groups(self):
-        return self._query_compiler.default_to_pandas(
-            lambda df: pandas.DataFrame.resample(df, **self.resample_kwargs).groups
-        )
-
-    @property
-    def indices(self):
-        return self._query_compiler.default_to_pandas(
-            lambda df: pandas.DataFrame.resample(df, **self.resample_kwargs).indices
-        )
-
-    def get_group(self, name, obj=None):
-        if self.resample_kwargs["axis"] == 0:
-            result = self.__groups.get_group(name)
-        else:
-            result = self.__groups.get_group(name).T
-        return result
-
-    def apply(self, func, *args, **kwargs):
-        from .dataframe import DataFrame
-
-        if isinstance(self._dataframe, DataFrame):
-            query_comp_op = self._query_compiler.resample_app_df
-        else:
-            query_comp_op = self._query_compiler.resample_app_ser
-
-        dataframe = DataFrame(
-            query_compiler=query_comp_op(
-                self.resample_kwargs,
-                func,
-                *args,
-                **kwargs,
-            )
-        )
-        if is_list_like(func) or isinstance(self._dataframe, DataFrame):
-            return dataframe
-        else:
-            if len(dataframe.index) == 1:
-                return dataframe.iloc[0]
-            else:
-                return dataframe.squeeze()
-
-    def aggregate(self, func, *args, **kwargs):
-        from .dataframe import DataFrame
-
-        if isinstance(self._dataframe, DataFrame):
-            query_comp_op = self._query_compiler.resample_agg_df
-        else:
-            query_comp_op = self._query_compiler.resample_agg_ser
-
-        dataframe = DataFrame(
-            query_compiler=query_comp_op(
-                self.resample_kwargs,
-                func,
-                *args,
-                **kwargs,
-            )
-        )
-        if is_list_like(func) or isinstance(self._dataframe, DataFrame):
-            return dataframe
-        else:
-            if len(dataframe.index) == 1:
-                return dataframe.iloc[0]
-            else:
-                return dataframe.squeeze()
-
-    def transform(self, arg, *args, **kwargs):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.resample_transform(
-                self.resample_kwargs, arg, *args, **kwargs
-            )
-        )
-
-    def pipe(self, func, *args, **kwargs):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.resample_pipe(
-                self.resample_kwargs, func, *args, **kwargs
-            )
-        )
-
-    def ffill(self, limit=None):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.resample_ffill(
-                self.resample_kwargs, limit
-            )
-        )
-
-    def backfill(self, limit=None):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.resample_backfill(
-                self.resample_kwargs, limit
-            )
-        )
-
-    def bfill(self, limit=None):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.resample_bfill(
-                self.resample_kwargs, limit
-            )
-        )
-
-    def pad(self, limit=None):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.resample_pad(
-                self.resample_kwargs, limit
-            )
-        )
-
-    def nearest(self, limit=None):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.resample_nearest(
-                self.resample_kwargs, limit
-            )
-        )
-
-    def fillna(self, method, limit=None):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.resample_fillna(
-                self.resample_kwargs, method, limit
-            )
-        )
-
-    def asfreq(self, fill_value=None):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.resample_asfreq(
-                self.resample_kwargs, fill_value
-            )
-        )
-
-    def interpolate(
-        self,
-        method="linear",
-        axis=0,
-        limit=None,
-        inplace=False,
-        limit_direction: Optional[str] = None,
-        limit_area=None,
-        downcast=None,
-        **kwargs,
-    ):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.resample_interpolate(
-                self.resample_kwargs,
-                method,
-                axis,
-                limit,
-                inplace,
-                limit_direction,
-                limit_area,
-                downcast,
-                **kwargs,
-            )
-        )
-
-    def count(self):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.resample_count(self.resample_kwargs)
-        )
-
-    def nunique(self, _method="nunique", *args, **kwargs):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.resample_nunique(
-                self.resample_kwargs, _method, *args, **kwargs
-            )
-        )
-
-    def first(self, _method="first", *args, **kwargs):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.resample_first(
-                self.resample_kwargs,
-                _method,
-                *args,
-                **kwargs,
-            )
-        )
-
-    def last(self, _method="last", *args, **kwargs):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.resample_last(
-                self.resample_kwargs,
-                _method,
-                *args,
-                **kwargs,
-            )
-        )
-
-    def max(self, _method="max", *args, **kwargs):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.resample_max(
-                self.resample_kwargs,
-                _method,
-                *args,
-                **kwargs,
-            )
-        )
-
-    def mean(self, _method="mean", *args, **kwargs):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.resample_mean(
-                self.resample_kwargs,
-                _method,
-                *args,
-                **kwargs,
-            )
-        )
-
-    def median(self, _method="median", *args, **kwargs):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.resample_median(
-                self.resample_kwargs,
-                _method,
-                *args,
-                **kwargs,
-            )
-        )
-
-    def min(self, _method="min", *args, **kwargs):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.resample_min(
-                self.resample_kwargs,
-                _method,
-                *args,
-                **kwargs,
-            )
-        )
-
-    def ohlc(self, _method="ohlc", *args, **kwargs):
-        from .dataframe import DataFrame
-
-        if isinstance(self._dataframe, DataFrame):
-            return DataFrame(
-                query_compiler=self._query_compiler.resample_ohlc_df(
-                    self.resample_kwargs,
-                    _method,
-                    *args,
-                    **kwargs,
-                )
-            )
-        else:
-            return DataFrame(
-                query_compiler=self._query_compiler.resample_ohlc_ser(
-                    self.resample_kwargs,
-                    _method,
-                    *args,
-                    **kwargs,
-                )
-            )
-
-    def prod(self, _method="prod", min_count=0, *args, **kwargs):
-        if self.resample_kwargs["axis"] == 0:
-            result = self.__groups.prod(min_count=min_count, *args, **kwargs)
-        else:
-            result = self.__groups.prod(min_count=min_count, *args, **kwargs).T
-        return result
-
-    def size(self):
-        from .series import Series
-
-        return Series(
-            query_compiler=self._query_compiler.resample_size(self.resample_kwargs)
-        )
-
-    def sem(self, _method="sem", *args, **kwargs):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.resample_sem(
-                self.resample_kwargs,
-                _method,
-                *args,
-                **kwargs,
-            )
-        )
-
-    def std(self, ddof=1, *args, **kwargs):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.resample_std(
-                self.resample_kwargs, *args, ddof=ddof, **kwargs
-            )
-        )
-
-    def sum(self, _method="sum", min_count=0, *args, **kwargs):
-        if self.resample_kwargs["axis"] == 0:
-            result = self.__groups.sum(min_count=min_count, *args, **kwargs)
-        else:
-            result = self.__groups.sum(min_count=min_count, *args, **kwargs).T
-        return result
-
-    def var(self, ddof=1, *args, **kwargs):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.resample_var(
-                self.resample_kwargs, *args, ddof=ddof, **kwargs
-            )
-        )
-
-    def quantile(self, q=0.5, **kwargs):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.resample_quantile(
-                self.resample_kwargs, q, **kwargs
-            )
-        )
-
-
-@_inherit_docstrings(pandas.core.window.rolling.Window)
-class Window(object):
-    def __init__(
-        self,
-        dataframe,
-        window,
-        min_periods=None,
-        center=False,
-        win_type=None,
-        on=None,
-        axis=0,
-        closed=None,
-        method="single",
-    ):
-        self._dataframe = dataframe
-        self._query_compiler = dataframe._query_compiler
-        self.window_args = [
-            window,
-            min_periods,
-            center,
-            win_type,
-            on,
-            axis,
-            closed,
+        # we can't use the regular default_to_pandas() method because self is one of the
+        # `inputs` to __array_ufunc__, and pandas has some checks on the identity of the
+        # inputs [1]. The usual default to pandas will call _to_pandas() on the inputs
+        # as well as on self, but that gives inputs[0] a different identity from self.
+        #
+        # [1] https://github.com/pandas-dev/pandas/blob/2c4c072ade78b96a9eb05097a5fcf4347a3768f3/pandas/_libs/ops_dispatch.pyx#L99-L109
+        ErrorMessage.default_to_pandas(message="__array_ufunc__")
+        pandas_self = self._to_pandas()
+        pandas_result = pandas_self.__array_ufunc__(
+            ufunc,
             method,
-        ]
-
-    def mean(self, *args, **kwargs):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.window_mean(
-                self.window_args, *args, **kwargs
-            )
+            *(
+                pandas_self if each_input is self else try_cast_to_pandas(each_input)
+                for each_input in inputs
+            ),
+            **try_cast_to_pandas(kwargs),
         )
+        if isinstance(pandas_result, pandas.DataFrame):
+            from .dataframe import DataFrame
 
-    def sum(self, *args, **kwargs):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.window_sum(
-                self.window_args, *args, **kwargs
-            )
-        )
+            return DataFrame(pandas_result)
+        elif isinstance(pandas_result, pandas.Series):
+            from .series import Series
 
-    def var(self, ddof=1, *args, **kwargs):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.window_var(
-                self.window_args, ddof, *args, **kwargs
-            )
-        )
+            return Series(pandas_result)
+        return pandas_result
 
-    def std(self, ddof=1, *args, **kwargs):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.window_std(
-                self.window_args, ddof, *args, **kwargs
-            )
-        )
-
-
-@_inherit_docstrings(
-    pandas.core.window.rolling.Rolling,
-    excluded=[pandas.core.window.rolling.Rolling.__init__],
-)
-class Rolling(object):
-    def __init__(
-        self,
-        dataframe,
-        window,
-        min_periods=None,
-        center=False,
-        win_type=None,
-        on=None,
-        axis=0,
-        closed=None,
-        method="single",
-    ):
-        self._dataframe = dataframe
-        self._query_compiler = dataframe._query_compiler
-        self.rolling_args = [
-            window,
-            min_periods,
-            center,
-            win_type,
-            on,
-            axis,
-            closed,
-            method,
-        ]
-
-    def count(self):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.rolling_count(self.rolling_args)
-        )
-
-    def sum(self, *args, **kwargs):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.rolling_sum(
-                self.rolling_args, *args, **kwargs
-            )
-        )
-
-    def mean(self, *args, **kwargs):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.rolling_mean(
-                self.rolling_args, *args, **kwargs
-            )
-        )
-
-    def median(self, **kwargs):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.rolling_median(
-                self.rolling_args, **kwargs
-            )
-        )
-
-    def var(self, ddof=1, *args, **kwargs):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.rolling_var(
-                self.rolling_args, ddof, *args, **kwargs
-            )
-        )
-
-    def std(self, ddof=1, *args, **kwargs):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.rolling_std(
-                self.rolling_args, ddof, *args, **kwargs
-            )
-        )
-
-    def min(self, *args, **kwargs):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.rolling_min(
-                self.rolling_args, *args, **kwargs
-            )
-        )
-
-    def max(self, *args, **kwargs):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.rolling_max(
-                self.rolling_args, *args, **kwargs
-            )
-        )
-
-    def corr(self, other=None, pairwise=None, *args, **kwargs):
-        from .dataframe import DataFrame
-        from .series import Series
-
-        if isinstance(other, DataFrame):
-            other = other._query_compiler.to_pandas()
-        elif isinstance(other, Series):
-            other = other._query_compiler.to_pandas().squeeze()
-
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.rolling_corr(
-                self.rolling_args, other, pairwise, *args, **kwargs
-            )
-        )
-
-    def cov(self, other=None, pairwise=None, ddof: Optional[int] = 1, **kwargs):
-        from .dataframe import DataFrame
-        from .series import Series
-
-        if isinstance(other, DataFrame):
-            other = other._query_compiler.to_pandas()
-        elif isinstance(other, Series):
-            other = other._query_compiler.to_pandas().squeeze()
-
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.rolling_cov(
-                self.rolling_args, other, pairwise, ddof, **kwargs
-            )
-        )
-
-    def skew(self, **kwargs):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.rolling_skew(
-                self.rolling_args, **kwargs
-            )
-        )
-
-    def kurt(self, **kwargs):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.rolling_kurt(
-                self.rolling_args, **kwargs
-            )
-        )
-
-    def apply(
-        self,
-        func,
-        raw=False,
-        engine="cython",
-        engine_kwargs=None,
-        args=None,
-        kwargs=None,
-    ):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.rolling_apply(
-                self.rolling_args,
-                func,
-                raw,
-                engine,
-                engine_kwargs,
-                args,
-                kwargs,
-            )
-        )
-
-    def aggregate(
-        self,
-        func,
-        *args,
-        **kwargs,
-    ):
-        from .dataframe import DataFrame
-
-        dataframe = DataFrame(
-            query_compiler=self._query_compiler.rolling_aggregate(
-                self.rolling_args,
-                func,
-                *args,
-                **kwargs,
-            )
-        )
-        if isinstance(self._dataframe, DataFrame):
-            return dataframe
-        elif is_list_like(func):
-            dataframe.columns = dataframe.columns.droplevel()
-            return dataframe
-        else:
-            return dataframe.squeeze()
-
-    agg = aggregate
-
-    def quantile(self, quantile, interpolation="linear", **kwargs):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.rolling_quantile(
-                self.rolling_args, quantile, interpolation, **kwargs
-            )
-        )
+    # namespace for additional Modin functions that are not available in Pandas
+    modin: ModinAPI = CachedAccessor("modin", ModinAPI)

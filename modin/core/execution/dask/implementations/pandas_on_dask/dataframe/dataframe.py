@@ -14,9 +14,8 @@
 """Module houses class that implements ``PandasDataframe``."""
 
 from modin.core.dataframe.pandas.dataframe.dataframe import PandasDataframe
-from ..partitioning.partition_manager import PandasOnDaskDataframePartitionManager
 
-from distributed.client import default_client
+from ..partitioning.partition_manager import PandasOnDaskDataframePartitionManager
 
 
 class PandasOnDaskDataframe(PandasDataframe):
@@ -43,39 +42,25 @@ class PandasOnDaskDataframe(PandasDataframe):
 
     _partition_mgr_cls = PandasOnDaskDataframePartitionManager
 
-    @property
-    def _row_lengths(self):
-        """
-        Compute the row partitions lengths if they are not cached.
+    @classmethod
+    def reconnect(cls, address, attributes):  # noqa: GL08
+        # The main goal is to configure the client for the worker process
+        # using the address passed by the custom `__reduce__` function
+        try:
+            from distributed import default_client
 
-        Returns
-        -------
-        list
-            A list of row partitions lengths.
-        """
-        client = default_client()
-        if self._row_lengths_cache is None:
-            self._row_lengths_cache = client.gather(
-                [obj.apply(lambda df: len(df)).future for obj in self._partitions.T[0]]
-            )
-        return self._row_lengths_cache
+            default_client()
+        except ValueError:
+            from distributed import Client
 
-    @property
-    def _column_widths(self):
-        """
-        Compute the column partitions widths if they are not cached.
+            # setup `default_client` for worker process
+            _ = Client(address)
+        obj = cls.__new__(cls)
+        obj.__dict__.update(attributes)
+        return obj
 
-        Returns
-        -------
-        list
-            A list of column partitions widths.
-        """
-        client = default_client()
-        if self._column_widths_cache is None:
-            self._column_widths_cache = client.gather(
-                [
-                    obj.apply(lambda df: len(df.columns)).future
-                    for obj in self._partitions[0]
-                ]
-            )
-        return self._column_widths_cache
+    def __reduce__(self):  # noqa: GL08
+        from distributed import default_client
+
+        address = default_client().scheduler_info()["address"]
+        return self.reconnect, (address, self.__dict__)

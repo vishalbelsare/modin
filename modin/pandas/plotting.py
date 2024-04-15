@@ -15,12 +15,15 @@
 
 from pandas import plotting as pdplot
 
-from modin.utils import instancer, to_pandas
+from modin.logging import ClassLogger
+from modin.pandas.io import to_pandas
+from modin.utils import instancer
+
 from .dataframe import DataFrame
 
 
 @instancer
-class Plotting(object):
+class Plotting(ClassLogger):
     """Wrapper of pandas plotting module."""
 
     def __dir__(self):

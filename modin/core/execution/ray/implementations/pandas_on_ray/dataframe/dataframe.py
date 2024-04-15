@@ -13,15 +13,10 @@
 
 """Module houses class that implements ``PandasDataframe`` using Ray."""
 
-import pandas
+from modin.core.dataframe.base.dataframe.utils import Axis
+from modin.core.dataframe.pandas.dataframe.dataframe import PandasDataframe
 
 from ..partitioning.partition_manager import PandasOnRayDataframePartitionManager
-from modin.core.dataframe.pandas.dataframe.dataframe import PandasDataframe
-from modin.core.storage_formats.pandas.parsers import (
-    find_common_type_cat as find_common_type,
-)
-
-import ray
 
 
 class PandasOnRayDataframe(PandasDataframe):
@@ -48,31 +43,24 @@ class PandasOnRayDataframe(PandasDataframe):
 
     _partition_mgr_cls = PandasOnRayDataframePartitionManager
 
-    @classmethod
-    def combine_dtypes(cls, list_of_dtypes, column_names):
+    def _get_lengths(self, parts, axis):
         """
-        Describe how data types should be combined when they do not match.
+        Get list of  dimensions for all the provided parts.
 
         Parameters
         ----------
-        list_of_dtypes : list
-            A list of ``pandas.Series`` with the data types.
-        column_names : list
-            The names of the columns that the data types map to.
+        parts : list
+            List of parttions.
+        axis : {0, 1}
+            The axis along which to get the lengths (0 - length across rows or, 1 - width across columns).
 
         Returns
         -------
-        pandas.Series
-             A ``pandas.Series`` containing the finalized data types.
+        list
         """
-        # Compute dtypes by getting collecting and combining all of the partitions. The
-        # reported dtypes from differing rows can be different based on the inference in
-        # the limited data seen by each worker. We use pandas to compute the exact dtype
-        # over the whole column for each column.
-        dtypes = (
-            pandas.concat(ray.get(list_of_dtypes), axis=1)
-            .apply(lambda row: find_common_type(row.values), axis=1)
-            .squeeze(axis=0)
-        )
-        dtypes.index = column_names
-        return dtypes
+        if axis == Axis.ROW_WISE:
+            dims = [part.length(False) for part in parts]
+        else:
+            dims = [part.width(False) for part in parts]
+
+        return self._partition_mgr_cls.materialize_futures(dims)

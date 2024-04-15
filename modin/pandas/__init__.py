@@ -11,230 +11,248 @@
 # ANY KIND, either express or implied. See the License for the specific language
 # governing permissions and limitations under the License.
 
+import warnings
+
 import pandas
+from packaging import version
 
-__pandas_version__ = "1.3.4"
+__pandas_version__ = "2.2"
 
-if pandas.__version__ != __pandas_version__:
-    import warnings
-
+if (
+    version.parse(pandas.__version__).release[:2]
+    != version.parse(__pandas_version__).release[:2]
+):
     warnings.warn(
-        "The pandas version installed {} does not match the supported pandas version in"
-        " Modin {}. This may cause undesired side effects!".format(
-            pandas.__version__, __pandas_version__
-        )
+        f"The pandas version installed ({pandas.__version__}) does not match the supported pandas version in"
+        + f" Modin ({__pandas_version__}.X). This may cause undesired side effects!"
     )
 
-from pandas import (
-    eval,
-    cut,
-    factorize,
-    test,
-    qcut,
-    date_range,
-    period_range,
-    Index,
-    MultiIndex,
-    CategoricalIndex,
-    bdate_range,
-    DatetimeIndex,
-    Timedelta,
-    Timestamp,
-    to_timedelta,
-    set_eng_float_format,
-    options,
-    Flags,
-    set_option,
-    NaT,
-    PeriodIndex,
-    Categorical,
-    Interval,
-    UInt8Dtype,
-    UInt16Dtype,
-    UInt32Dtype,
-    UInt64Dtype,
-    SparseDtype,
-    Int8Dtype,
-    Int16Dtype,
-    Int32Dtype,
-    Int64Dtype,
-    Float32Dtype,
-    Float64Dtype,
-    StringDtype,
-    BooleanDtype,
-    CategoricalDtype,
-    DatetimeTZDtype,
-    IntervalDtype,
-    PeriodDtype,
-    RangeIndex,
-    Int64Index,
-    UInt64Index,
-    Float64Index,
-    TimedeltaIndex,
-    IntervalIndex,
-    IndexSlice,
-    Grouper,
-    array,
-    Period,
-    show_versions,
-    DateOffset,
-    timedelta_range,
-    infer_freq,
-    interval_range,
-    ExcelWriter,
-    datetime,
-    NamedAgg,
-    NA,
-    api,
-)
+# The extensions assigned to this module
+_PD_EXTENSIONS_ = {}
+
+# to not pollute namespace
+del version
+
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    from pandas import (
+        eval,
+        factorize,
+        test,
+        date_range,
+        period_range,
+        Index,
+        MultiIndex,
+        CategoricalIndex,
+        bdate_range,
+        DatetimeIndex,
+        Timedelta,
+        Timestamp,
+        set_eng_float_format,
+        options,
+        describe_option,
+        set_option,
+        get_option,
+        reset_option,
+        option_context,
+        NaT,
+        PeriodIndex,
+        Categorical,
+        Interval,
+        UInt8Dtype,
+        UInt16Dtype,
+        UInt32Dtype,
+        UInt64Dtype,
+        SparseDtype,
+        Int8Dtype,
+        Int16Dtype,
+        Int32Dtype,
+        Int64Dtype,
+        StringDtype,
+        BooleanDtype,
+        CategoricalDtype,
+        DatetimeTZDtype,
+        IntervalDtype,
+        PeriodDtype,
+        RangeIndex,
+        TimedeltaIndex,
+        IntervalIndex,
+        IndexSlice,
+        Grouper,
+        array,
+        Period,
+        DateOffset,
+        timedelta_range,
+        infer_freq,
+        interval_range,
+        ExcelWriter,
+        NamedAgg,
+        NA,
+        api,
+        ArrowDtype,
+        Flags,
+        Float32Dtype,
+        Float64Dtype,
+        from_dummies,
+        testing,
+    )
+
 import os
-import multiprocessing
 
-from modin.config import Engine, Parameter
-
-# Set this so that Pandas doesn't try to multithread by itself
-os.environ["OMP_NUM_THREADS"] = "1"
+from modin.config import Parameter
 
 _is_first_update = {}
-dask_client = None
-_NOINIT_ENGINES = {
-    "Python",
-}  # engines that don't require initialization, useful for unit tests
 
 
 def _update_engine(publisher: Parameter):
-    global dask_client
-    from modin.config import StorageFormat, CpuCount
-    from modin.config.envvars import IsExperimental
-    from modin.config.pubsub import ValueSource
+    from modin.config import (
+        CpuCount,
+        Engine,
+        IsExperimental,
+        StorageFormat,
+        ValueSource,
+    )
 
-    if (
-        StorageFormat.get() == "Omnisci"
-        and publisher.get_value_source() == ValueSource.DEFAULT
-    ):
+    # Set this so that Pandas doesn't try to multithread by itself
+    os.environ["OMP_NUM_THREADS"] = "1"
+
+    sfmt = StorageFormat.get()
+
+    if sfmt == "Hdk":
+        is_hdk = True
+    elif sfmt == "Omnisci":
+        is_hdk = True
+        StorageFormat.put("Hdk")
+        warnings.warn(
+            "The OmniSci storage format has been deprecated. Please use "
+            + '`StorageFormat.put("hdk")` or `MODIN_STORAGE_FORMAT="hdk"` instead.'
+        )
+    else:
+        is_hdk = False
+
+    if is_hdk and publisher.get_value_source() == ValueSource.DEFAULT:
         publisher.put("Native")
         IsExperimental.put(True)
-    elif (
+    if (
         publisher.get() == "Native"
         and StorageFormat.get_value_source() == ValueSource.DEFAULT
     ):
-        StorageFormat.put("Omnisci")
+        is_hdk = True
+        StorageFormat.put("Hdk")
         IsExperimental.put(True)
-    elif publisher.get() == "Ray":
+
+    if publisher.get() == "Ray":
         if _is_first_update.get("Ray", True):
-            from modin.core.execution.ray.common.utils import initialize_ray
+            from modin.core.execution.ray.common import initialize_ray
 
             initialize_ray()
     elif publisher.get() == "Native":
-        # With OmniSci storage format there is only a single worker per node
+        # With HDK storage format there is only a single worker per node
         # and we allow it to work on all cores.
-        if StorageFormat.get() == "Omnisci":
+        if is_hdk:
             os.environ["OMP_NUM_THREADS"] = str(CpuCount.get())
         else:
             raise ValueError(
-                f"Storage format should be 'Omnisci' with 'Native' engine, but provided {StorageFormat.get()}."
+                f"Storage format should be 'Hdk' with 'Native' engine, but provided {sfmt}."
             )
     elif publisher.get() == "Dask":
         if _is_first_update.get("Dask", True):
-            from modin.core.execution.dask.common.utils import initialize_dask
+            from modin.core.execution.dask.common import initialize_dask
 
             initialize_dask()
-    elif publisher.get() == "Cloudray":
-        from modin.experimental.cloud import get_connection
+    elif publisher.get() == "Unidist":
+        if _is_first_update.get("Unidist", True):
+            from modin.core.execution.unidist.common import initialize_unidist
 
-        conn = get_connection()
-        if _is_first_update.get("Cloudray", True):
-
-            @conn.teleport
-            def init_remote_ray(partition):
-                from ray import ray_constants
-                import modin
-                from modin.core.execution.ray.common.utils import initialize_ray
-
-                modin.set_execution("Ray", partition)
-                initialize_ray(
-                    override_is_cluster=True,
-                    override_redis_address=f"localhost:{ray_constants.DEFAULT_PORT}",
-                    override_redis_password=ray_constants.REDIS_DEFAULT_PASSWORD,
-                )
-
-            init_remote_ray(StorageFormat.get())
-            # import FactoryDispatcher here to initialize IO class
-            # so it doesn't skew read_csv() timings later on
-            import modin.core.execution.dispatching.factories.dispatcher  # noqa: F401
-        else:
-            get_connection().modules["modin"].set_execution("Ray", StorageFormat.get())
-    elif publisher.get() == "Cloudpython":
-        from modin.experimental.cloud import get_connection
-
-        get_connection().modules["modin"].set_execution("Python")
-    elif publisher.get() == "Cloudnative":
-        from modin.experimental.cloud import get_connection
-
-        assert (
-            StorageFormat.get() == "Omnisci"
-        ), f"Storage format should be 'Omnisci' with 'Cloudnative' engine, but provided {StorageFormat.get()}."
-        get_connection().modules["modin"].set_execution("Native", "OmniSci")
-
-    elif publisher.get() not in _NOINIT_ENGINES:
+            initialize_unidist()
+    elif publisher.get() not in Engine.NOINIT_ENGINES:
         raise ImportError("Unrecognized execution engine: {}.".format(publisher.get()))
 
     _is_first_update[publisher.get()] = False
 
 
+from modin.pandas import arrays, errors
+from modin.utils import show_versions
+
 from .. import __version__
 from .dataframe import DataFrame
-from .io import (
-    read_csv,
-    read_parquet,
-    read_json,
-    read_html,
-    read_clipboard,
-    read_excel,
-    read_hdf,
-    read_feather,
-    read_stata,
-    read_sas,
-    read_pickle,
-    read_sql,
-    read_gbq,
-    read_table,
-    read_fwf,
-    read_sql_table,
-    read_sql_query,
-    read_spss,
-    ExcelFile,
-    to_pickle,
-    HDFStore,
-    json_normalize,
-    read_orc,
-    read_xml,
-)
-from .series import Series
 from .general import (
     concat,
+    crosstab,
+    cut,
+    get_dummies,
     isna,
     isnull,
+    lreshape,
+    melt,
     merge,
     merge_asof,
     merge_ordered,
-    pivot_table,
-    notnull,
     notna,
+    notnull,
     pivot,
-    to_numeric,
+    pivot_table,
+    qcut,
     to_datetime,
+    to_numeric,
+    to_timedelta,
     unique,
     value_counts,
-    get_dummies,
-    melt,
-    crosstab,
-    lreshape,
     wide_to_long,
 )
+from .io import (
+    ExcelFile,
+    HDFStore,
+    json_normalize,
+    read_clipboard,
+    read_csv,
+    read_excel,
+    read_feather,
+    read_fwf,
+    read_gbq,
+    read_hdf,
+    read_html,
+    read_json,
+    read_orc,
+    read_parquet,
+    read_pickle,
+    read_sas,
+    read_spss,
+    read_sql,
+    read_sql_query,
+    read_sql_table,
+    read_stata,
+    read_table,
+    read_xml,
+    to_pickle,
+)
 from .plotting import Plotting as plotting
+from .series import Series
 
-__all__ = [
+
+def __getattr__(name: str):
+    """
+    Overrides getattr on the module to enable extensions.
+
+    Parameters
+    ----------
+    name : str
+        The name of the attribute being retrieved.
+
+    Returns
+    -------
+    Attribute
+        Returns the extension attribute, if it exists, otherwise returns the attribute
+        imported in this file.
+    """
+    try:
+        return _PD_EXTENSIONS_.get(name, globals()[name])
+    except KeyError:
+        raise AttributeError(f"module 'modin.pandas' has no attribute '{name}'")
+
+
+__all__ = [  # noqa: F405
+    "_PD_EXTENSIONS_",
     "DataFrame",
     "Series",
     "read_csv",
@@ -276,7 +294,11 @@ __all__ = [
     "to_timedelta",
     "set_eng_float_format",
     "options",
+    "describe_option",
     "set_option",
+    "get_option",
+    "reset_option",
+    "option_context",
     "CategoricalIndex",
     "Timedelta",
     "Timestamp",
@@ -305,9 +327,6 @@ __all__ = [
     "StringDtype",
     "NA",
     "RangeIndex",
-    "Int64Index",
-    "UInt64Index",
-    "Float64Index",
     "TimedeltaIndex",
     "IntervalIndex",
     "IndexSlice",
@@ -336,9 +355,15 @@ __all__ = [
     "to_numeric",
     "unique",
     "value_counts",
-    "datetime",
     "NamedAgg",
     "api",
+    "read_xml",
+    "ArrowDtype",
+    "Flags",
+    "Float32Dtype",
+    "Float64Dtype",
+    "from_dummies",
+    "errors",
 ]
 
-del pandas, Engine, Parameter
+del pandas, Parameter

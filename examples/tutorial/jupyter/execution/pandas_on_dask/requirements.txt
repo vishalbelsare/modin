@@ -1,0 +1,5 @@
+fsspec>=2022.11.0
+jupyterlab
+ipywidgets
+modin[dask]
+modin[spreadsheet]

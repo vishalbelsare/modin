@@ -13,13 +13,16 @@
 
 """Module houses class that wraps data (block partition) and its metadata."""
 
-import ray
 import cudf
 import cupy
-import numpy as np
 import cupy as cp
-from modin.core.dataframe.pandas.partitioning.partition import PandasDataframePartition
+import numpy as np
+import ray
 from pandas.core.dtypes.common import is_list_like
+
+from modin.core.dataframe.pandas.partitioning.partition import PandasDataframePartition
+from modin.core.execution.ray.common import RayWrapper
+from modin.core.execution.ray.common.utils import ObjectIDType
 
 
 class cuDFOnRayDataframePartition(PandasDataframePartition):
@@ -39,22 +42,8 @@ class cuDFOnRayDataframePartition(PandasDataframePartition):
         Width or reference to it of wrapped ``pandas.DataFrame``.
     """
 
-    _length_cache = None
-    _width_cache = None
-
-    @property
-    def __constructor__(self):
-        """
-        Create a new instance of this object.
-
-        Returns
-        -------
-        cuDFOnRayDataframePartition
-            New instance of cuDF partition.
-        """
-        return type(self)
-
     def __init__(self, gpu_manager, key, length=None, width=None):
+        super().__init__()
         self.gpu_manager = gpu_manager
         self.key = key
         self._length_cache = length
@@ -70,7 +59,7 @@ class cuDFOnRayDataframePartition(PandasDataframePartition):
             A copy of this object.
         """
         # Shallow copy.
-        return cuDFOnRayDataframePartition(
+        return self.__constructor__(
             self.gpu_manager, self.key, self._length_cache, self._width_cache
         )
 
@@ -94,7 +83,7 @@ class cuDFOnRayDataframePartition(PandasDataframePartition):
         """
         return gpu_manager.put.remote(pandas_dataframe)
 
-    def apply(self, func, **kwargs):
+    def apply(self, func, *args, **kwargs):
         """
         Apply `func` to this partition.
 
@@ -102,8 +91,10 @@ class cuDFOnRayDataframePartition(PandasDataframePartition):
         ----------
         func : callable
             A function to apply.
+        *args : iterable
+            Additional positional arguments to be passed in `func`.
         **kwargs : dict
-            Additional keywords arguments to be passed in `func`.
+            Additional keyword arguments to be passed in `func`.
 
         Returns
         -------
@@ -111,7 +102,9 @@ class cuDFOnRayDataframePartition(PandasDataframePartition):
             A reference to integer key of result
             in internal dict-storage of `self.gpu_manager`.
         """
-        return self.gpu_manager.apply.remote(self.get_key(), None, func, **kwargs)
+        return self.gpu_manager.apply.remote(
+            self.get_key(), None, func, *args, **kwargs
+        )
 
     # TODO: Check the need of this method
     def apply_result_not_dataframe(self, func, **kwargs):
@@ -136,7 +129,7 @@ class cuDFOnRayDataframePartition(PandasDataframePartition):
             self.get_key(), func, **kwargs
         )
 
-    def add_to_apply_calls(self, func, **kwargs):
+    def add_to_apply_calls(self, func, length=None, width=None, *args, **kwargs):
         """
         Apply `func` to this partition and create new.
 
@@ -144,6 +137,12 @@ class cuDFOnRayDataframePartition(PandasDataframePartition):
         ----------
         func : callable
             A function to apply.
+        length : ray.ObjectRef or int, optional
+            Length, or reference to length, of wrapped ``pandas.DataFrame``.
+        width : ray.ObjectRef or int, optional
+            Width, or reference to width, of wrapped ``pandas.DataFrame``.
+        *args : tuple
+            Positional arguments to be passed in `func`.
         **kwargs : dict
             Additional keywords arguments to be passed in `func`.
 
@@ -156,7 +155,12 @@ class cuDFOnRayDataframePartition(PandasDataframePartition):
         -----
         We eagerly schedule the apply `func` and produce a new ``cuDFOnRayDataframePartition``.
         """
-        return cuDFOnRayDataframePartition(self.gpu_manager, self.apply(func, **kwargs))
+        return self.__constructor__(
+            self.gpu_manager,
+            self.apply(func, *args, **kwargs),
+            length=length,
+            width=width,
+        )
 
     @classmethod
     def preprocess_func(cls, func):
@@ -173,11 +177,18 @@ class cuDFOnRayDataframePartition(PandasDataframePartition):
         ray.ObjectRef
             A reference to `func` in Ray object store.
         """
-        return ray.put(func)
+        return RayWrapper.put(func)
 
-    def length(self):
+    def length(self, materialize=True):
         """
         Get the length of the object wrapped by this partition.
+
+        Parameters
+        ----------
+        materialize : bool, default: True
+            Whether to forcibly materialize the result into an integer. If ``False``
+            was specified, may return a future of the result if it hasn't been
+            materialized yet.
 
         Returns
         -------
@@ -186,11 +197,21 @@ class cuDFOnRayDataframePartition(PandasDataframePartition):
         """
         if self._length_cache:
             return self._length_cache
-        return self.gpu_manager.length.remote(self.get_key())
+        self._length_cache = self.gpu_manager.length.remote(self.get_key())
+        if isinstance(self._length_cache, ObjectIDType) and materialize:
+            self._length_cache = RayWrapper.materialize(self._length_cache)
+        return self._length_cache
 
-    def width(self):
+    def width(self, materialize=True):
         """
         Get the width of the object wrapped by this partition.
+
+        Parameters
+        ----------
+        materialize : bool, default: True
+            Whether to forcibly materialize the result into an integer. If ``False``
+            was specified, may return a future of the result if it hasn't been
+            materialized yet.
 
         Returns
         -------
@@ -199,17 +220,20 @@ class cuDFOnRayDataframePartition(PandasDataframePartition):
         """
         if self._width_cache:
             return self._width_cache
-        return self.gpu_manager.width.remote(self.get_key())
+        self._width_cache = self.gpu_manager.width.remote(self.get_key())
+        if isinstance(self._width_cache, ObjectIDType) and materialize:
+            self._width_cache = RayWrapper.materialize(self._width_cache)
+        return self._width_cache
 
-    def mask(self, row_indices, col_indices):
+    def mask(self, row_labels, col_labels):
         """
         Select columns or rows from given indices.
 
         Parameters
         ----------
-        row_indices : list of hashable
+        row_labels : list of hashable
             The row labels to extract.
-        col_indices : list of hashable
+        col_labels : list of hashable
             The column labels to extract.
 
         Returns
@@ -219,18 +243,18 @@ class cuDFOnRayDataframePartition(PandasDataframePartition):
             in internal dict-storage of `self.gpu_manager`.
         """
         if (
-            (isinstance(row_indices, slice) and row_indices == slice(None))
+            (isinstance(row_labels, slice) and row_labels == slice(None))
             or (
-                not isinstance(row_indices, slice)
+                not isinstance(row_labels, slice)
                 and self._length_cache is not None
-                and len(row_indices) == self._length_cache
+                and len(row_labels) == self._length_cache
             )
         ) and (
-            (isinstance(col_indices, slice) and col_indices == slice(None))
+            (isinstance(col_labels, slice) and col_labels == slice(None))
             or (
-                not isinstance(col_indices, slice)
+                not isinstance(col_labels, slice)
                 and self._width_cache is not None
-                and len(col_indices) == self._width_cache
+                and len(col_labels) == self._width_cache
             )
         ):
             return self.__copy__()
@@ -238,24 +262,24 @@ class cuDFOnRayDataframePartition(PandasDataframePartition):
         # CuDF currently does not support indexing multiindices with arrays,
         # so we have to create a boolean array where the desire indices are true.
         # TODO(kvu35): Check if this functionality is fixed in the latest version of cudf
-        def iloc(df, row_indices, col_indices):
+        def iloc(df, row_labels, col_labels):
             if isinstance(df.index, cudf.core.multiindex.MultiIndex) and is_list_like(
-                row_indices
+                row_labels
             ):
-                new_row_indices = cp.full(
+                new_row_labels = cp.full(
                     (1, df.index.size), False, dtype=bool
                 ).squeeze()
-                new_row_indices[row_indices] = True
-                row_indices = new_row_indices
-            return df.iloc[row_indices, col_indices]
+                new_row_labels[row_labels] = True
+                row_labels = new_row_labels
+            return df.iloc[row_labels, col_labels]
 
         iloc = cuDFOnRayDataframePartition.preprocess_func(iloc)
         return self.gpu_manager.apply.remote(
             self.key,
             None,
             iloc,
-            col_indices=col_indices,
-            row_indices=row_indices,
+            col_labels=col_labels,
+            row_labels=row_labels,
         )
 
     def get_gpu_manager(self):
@@ -277,7 +301,11 @@ class cuDFOnRayDataframePartition(PandasDataframePartition):
         -------
         int
         """
-        return ray.get(self.key) if isinstance(self.key, ray.ObjectRef) else self.key
+        return (
+            RayWrapper.materialize(self.key)
+            if isinstance(self.key, ray.ObjectRef)
+            else self.key
+        )
 
     def get_object_id(self):
         """
@@ -311,7 +339,7 @@ class cuDFOnRayDataframePartition(PandasDataframePartition):
         -------
         pandas.DataFrame
         """
-        return ray.get(
+        return RayWrapper.materialize(
             self.gpu_manager.apply_non_persistent.remote(
                 self.get_key(), None, cudf.DataFrame.to_pandas
             )
@@ -359,7 +387,7 @@ class cuDFOnRayDataframePartition(PandasDataframePartition):
             self.get_key(),
             lambda x: x,
         )
-        new_key = ray.get(new_key)
+        new_key = RayWrapper.materialize(new_key)
         return self.__constructor__(self.gpu_manager, new_key)
 
     # TODO(kvu35): buggy garbage collector reference issue #43

@@ -13,17 +13,18 @@
 
 """Module default2pandas provides templates for a query compiler default-to-pandas methods."""
 
+from .binary import BinaryDefault
+from .cat import CatDefault
 from .dataframe import DataFrameDefault
 from .datetime import DateTimeDefault
+from .default import DefaultMethod
+from .groupby import GroupByDefault, SeriesGroupByDefault
+from .list import ListDefault
+from .resample import ResampleDefault
+from .rolling import ExpandingDefault, RollingDefault
 from .series import SeriesDefault
 from .str import StrDefault
-from .binary import BinaryDefault
-from .any import AnyDefault
-from .resample import ResampleDefault
-from .rolling import RollingDefault
-from .default import DefaultMethod
-from .cat import CatDefault
-from .groupby import GroupByDefault
+from .struct import StructDefault
 
 __all__ = [
     "DataFrameDefault",
@@ -31,10 +32,13 @@ __all__ = [
     "SeriesDefault",
     "StrDefault",
     "BinaryDefault",
-    "AnyDefault",
     "ResampleDefault",
     "RollingDefault",
+    "ExpandingDefault",
     "DefaultMethod",
     "CatDefault",
     "GroupByDefault",
+    "SeriesGroupByDefault",
+    "ListDefault",
+    "StructDefault",
 ]

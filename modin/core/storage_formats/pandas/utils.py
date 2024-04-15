@@ -13,71 +13,58 @@
 
 """Contains utility functions for frame partitioning."""
 
+from __future__ import annotations
+
+import re
+from math import ceil
+from typing import Generator, Hashable, List, Optional
+
 import numpy as np
 import pandas
 
+from modin.config import MinPartitionSize, NPartitions
 
-def get_default_chunksize(length, num_splits):
+
+def compute_chunksize(axis_len: int, num_splits: int, min_block_size: int) -> int:
     """
-    Get the most equal chunksize possible based on length and number of splits.
+    Compute the number of elements (rows/columns) to include in each partition.
+
+    Chunksize is defined the same for both axes.
 
     Parameters
     ----------
-    length : int
-        The length to split (number of rows/columns).
+    axis_len : int
+        Element count in an axis.
     num_splits : int
         The number of splits.
+    min_block_size : int
+        Minimum number of rows/columns in a single split.
 
     Returns
     -------
     int
-        Computed chunksize.
+        Integer number of rows/columns to split the DataFrame will be returned.
     """
-    return (
-        length // num_splits if length % num_splits == 0 else length // num_splits + 1
-    )
+    if not isinstance(min_block_size, int) or min_block_size <= 0:
+        raise ValueError(
+            f"'min_block_size' should be int > 0, passed: {min_block_size=}"
+        )
 
-
-def compute_chunksize(df, num_splits, default_block_size=32, axis=None):
-    """
-    Compute the number of rows and/or columns to include in each partition.
-
-    Parameters
-    ----------
-    df : pandas.DataFrame
-        DataFrame to split.
-    num_splits : int
-        Number of splits to separate the DataFrame into.
-    default_block_size : int, default: 32
-        Minimum number of rows/columns in a single split.
-    axis : int, optional
-        Axis to split across. If not specified - split accros both axes.
-
-    Returns
-    -------
-    int if axis was specified, tuple of ints otherwise,
-        If axis is 1 or 0, returns an integer number of rows/columns to split the
-        DataFrame. If axis is None, returns a tuple containing both.
-    """
-    if axis == 0 or axis is None:
-        row_chunksize = get_default_chunksize(len(df.index), num_splits)
-        # Take the min of the default and the memory-usage chunksize first to avoid a
-        # large amount of small partitions.
-        row_chunksize = max(1, row_chunksize, default_block_size)
-        if axis == 0:
-            return row_chunksize
-    # We always execute this because we can only get here if axis is 1 or None.
-    col_chunksize = get_default_chunksize(len(df.columns), num_splits)
-    # Take the min of the default and the memory-usage chunksize first to avoid a
+    chunksize = axis_len // num_splits
+    if axis_len % num_splits:
+        chunksize += 1
+    # chunksize shouldn't be less than `min_block_size` to avoid a
     # large amount of small partitions.
-    col_chunksize = max(1, col_chunksize, default_block_size)
-    if axis == 1:
-        return col_chunksize
-
-    return row_chunksize, col_chunksize
+    return max(chunksize, min_block_size)
 
 
-def split_result_of_axis_func_pandas(axis, num_splits, result, length_list=None):
+def split_result_of_axis_func_pandas(
+    axis: int,
+    num_splits: int,
+    result: pandas.DataFrame,
+    min_block_size: int,
+    length_list: Optional[list] = None,
+) -> list[pandas.DataFrame]:
     """
     Split pandas DataFrame evenly based on the provided number of splits.
 
@@ -90,6 +77,8 @@ def split_result_of_axis_func_pandas(axis, num_splits, result, length_list=None)
         This parameter is ignored if `length_list` is specified.
     result : pandas.DataFrame
         DataFrame to split.
+    min_block_size : int
+        Minimum number of rows/columns in a single split.
     length_list : list of ints, optional
         List of slice lengths to split DataFrame into. This is used to
         return the DataFrame to its original partitioning schema.
@@ -99,27 +88,98 @@ def split_result_of_axis_func_pandas(axis, num_splits, result, length_list=None)
     list of pandas.DataFrames
         Splitted dataframe represented by list of frames.
     """
-    if length_list is not None:
-        length_list.insert(0, 0)
-        sums = np.cumsum(length_list)
-        if axis == 0 or isinstance(result, pandas.Series):
-            return [result.iloc[sums[i] : sums[i + 1]] for i in range(len(sums) - 1)]
-        else:
-            return [result.iloc[:, sums[i] : sums[i + 1]] for i in range(len(sums) - 1)]
+    return list(
+        generate_result_of_axis_func_pandas(
+            axis, num_splits, result, min_block_size, length_list
+        )
+    )
 
+
+def generate_result_of_axis_func_pandas(
+    axis: int,
+    num_splits: int,
+    result: pandas.DataFrame,
+    min_block_size: int,
+    length_list: Optional[list] = None,
+) -> Generator:
+    """
+    Generate pandas DataFrame evenly based on the provided number of splits.
+
+    Parameters
+    ----------
+    axis : {0, 1}
+        Axis to split across. 0 means index axis when 1 means column axis.
+    num_splits : int
+        Number of splits to separate the DataFrame into.
+        This parameter is ignored if `length_list` is specified.
+    result : pandas.DataFrame
+        DataFrame to split.
+    min_block_size : int
+        Minimum number of rows/columns in a single split.
+    length_list : list of ints, optional
+        List of slice lengths to split DataFrame into. This is used to
+        return the DataFrame to its original partitioning schema.
+
+    Yields
+    ------
+    Generator
+        Generates 'num_splits' dataframes as a result of axis function.
+    """
     if num_splits == 1:
-        return [result]
-    # We do this to restore block partitioning
-    chunksize = compute_chunksize(result, num_splits, axis=axis)
-    if axis == 0 or isinstance(result, pandas.Series):
-        return [
-            result.iloc[chunksize * i : chunksize * (i + 1)] for i in range(num_splits)
-        ]
+        yield result
     else:
-        return [
-            result.iloc[:, chunksize * i : chunksize * (i + 1)]
-            for i in range(num_splits)
-        ]
+        if length_list is None:
+            length_list = get_length_list(
+                result.shape[axis], num_splits, min_block_size
+            )
+        # Inserting the first "zero" to properly compute cumsum indexing slices
+        length_list = np.insert(length_list, obj=0, values=[0])
+        sums = np.cumsum(length_list)
+        axis = 0 if isinstance(result, pandas.Series) else axis
+
+        for i in range(len(sums) - 1):
+            # We do this to restore block partitioning
+            if axis == 0:
+                chunk = result.iloc[sums[i] : sums[i + 1]]
+            else:
+                chunk = result.iloc[:, sums[i] : sums[i + 1]]
+
+            # Sliced MultiIndex still stores all encoded values of the original index, explicitly
+            # asking it to drop unused values in order to save memory.
+            if isinstance(chunk.axes[axis], pandas.MultiIndex):
+                chunk = chunk.set_axis(
+                    chunk.axes[axis].remove_unused_levels(), axis=axis, copy=False
+                )
+            yield chunk
+
+
+def get_length_list(axis_len: int, num_splits: int, min_block_size: int) -> list:
+    """
+    Compute partitions lengths along the axis with the specified number of splits.
+
+    Parameters
+    ----------
+    axis_len : int
+        Element count in an axis.
+    num_splits : int
+        Number of splits along the axis.
+    min_block_size : int
+        Minimum number of rows/columns in a single split.
+
+    Returns
+    -------
+    list of ints
+        List of integer lengths of partitions.
+    """
+    chunksize = compute_chunksize(axis_len, num_splits, min_block_size)
+    return [
+        (
+            chunksize
+            if (i + 1) * chunksize <= axis_len
+            else max(0, axis_len - i * chunksize)
+        )
+        for i in range(num_splits)
+    ]
 
 
 def length_fn_pandas(df):
@@ -152,3 +212,52 @@ def width_fn_pandas(df):
     """
     assert isinstance(df, pandas.DataFrame)
     return len(df.columns) if len(df.columns) > 0 else 0
+
+
+def get_group_names(regex: "re.Pattern") -> "List[Hashable]":
+    """
+    Get named groups from compiled regex.
+
+    Unnamed groups are numbered.
+
+    Parameters
+    ----------
+    regex : compiled regex
+
+    Returns
+    -------
+    list of column labels
+    """
+    names = {v: k for k, v in regex.groupindex.items()}
+    return [names.get(1 + i, i) for i in range(regex.groups)]
+
+
+def merge_partitioning(left, right, axis=1):
+    """
+    Get the number of splits across the `axis` for the two dataframes being concatenated.
+
+    Parameters
+    ----------
+    left : PandasDataframe
+    right : PandasDataframe
+    axis : int, default: 1
+
+    Returns
+    -------
+    int
+    """
+    lshape = left._row_lengths_cache if axis == 0 else left._column_widths_cache
+    rshape = right._row_lengths_cache if axis == 0 else right._column_widths_cache
+
+    if lshape is not None and rshape is not None:
+        res_shape = sum(lshape) + sum(rshape)
+        chunk_size = compute_chunksize(
+            axis_len=res_shape,
+            num_splits=NPartitions.get(),
+            min_block_size=MinPartitionSize.get(),
+        )
+        return ceil(res_shape / chunk_size)
+    else:
+        lsplits = left._partitions.shape[axis]
+        rsplits = right._partitions.shape[axis]
+        return min(lsplits + rsplits, NPartitions.get())

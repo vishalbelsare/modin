@@ -12,3 +12,14 @@
 # governing permissions and limitations under the License.
 
 """Base Modin Dataframe classes related to its partitioning and optimized for cuDF on Ray execution."""
+
+from .gpu_manager import GPUManager
+from .partition import cuDFOnRayDataframePartition
+from .partition_manager import GPU_MANAGERS, cuDFOnRayDataframePartitionManager
+
+__all__ = [
+    "GPUManager",
+    "GPU_MANAGERS",
+    "cuDFOnRayDataframePartitionManager",
+    "cuDFOnRayDataframePartition",
+]

@@ -14,8 +14,8 @@
 """Module contains decorators for documentation of the query compiler methods."""
 
 from functools import partial
-from modin.utils import append_to_docstring, format_string, align_indents
 
+from modin.utils import align_indents, append_to_docstring, format_string
 
 _one_column_warning = """
 .. warning::
@@ -209,7 +209,7 @@ def doc_binary_method(operation, sign, self_on_right=False, op_type="arithmetic"
 
 def doc_reduce_agg(method, refer_to, params=None, extra_params=None):
     """
-    Build decorator which adds docstring for the reduction method.
+    Build decorator which adds docstring for the reduce method.
 
     Parameters
     ----------
@@ -244,8 +244,6 @@ def doc_reduce_agg(method, refer_to, params=None, extra_params=None):
     if params is None:
         params = """
         axis : {{0, 1}}
-        level : None, default: None
-            Serves the compatibility purpose. Always has to be None.
         numeric_only : bool, optional"""
 
     extra_params_map = {
@@ -282,11 +280,11 @@ def doc_reduce_agg(method, refer_to, params=None, extra_params=None):
 doc_cum_agg = partial(
     doc_qc_method,
     template="""
-    Get cummulative {method} for every row or column.
+    Get cumulative {method} for every row or column.
 
     Parameters
     ----------
-    axis : {{0, 1}}
+    fold_axis : {{0, 1}}
     skipna : bool
     **kwargs : dict
         Serves the compatibility purpose. Does not affect the result.
@@ -321,20 +319,20 @@ doc_resample = partial(
 
         {build_rules}
     """,
-    refer_to_module_name="DataFrame.Resampler",
+    refer_to_module_name="resample.Resampler",
 )
 
 
-def doc_resample_reduction(result, refer_to, params=None, compatibility_params=True):
+def doc_resample_reduce(result, refer_to, params=None, compatibility_params=True):
     """
-    Build decorator which adds docstring for the resample reduction method.
+    Build decorator which adds docstring for the resample reduce method.
 
     Parameters
     ----------
     result : str
         The result of the method.
     refer_to : str
-        Method name in ``modin.pandas.base.Resampler`` module to refer to for
+        Method name in ``modin.pandas.resample.Resampler`` module to refer to for
         more information about parameters and output format.
     params : str, optional
         Method parameters in the NumPy docstyle format to substitute
@@ -371,7 +369,7 @@ def doc_resample_reduction(result, refer_to, params=None, compatibility_params=T
 
     build_rules = f"""
             - Labels on the specified axis are the group names (time-stamps)
-            - Labels on the opposit of specified axis are preserved.
+            - Labels on the opposite of specified axis are preserved.
             - Each element of QueryCompiler is the {result} for the
               corresponding group and column/row."""
     return doc_resample(
@@ -393,7 +391,7 @@ def doc_resample_agg(action, output, refer_to, params=None):
     output : str
         What is the content of column names in the result.
     refer_to : str
-        Method name in ``modin.pandas.base.Resampler`` module to refer to for
+        Method name in ``modin.pandas.resample.Resampler`` module to refer to for
         more information about parameters and output format.
     params : str, optional
         Method parameters in the NumPy docstyle format to substitute
@@ -421,7 +419,7 @@ def doc_resample_agg(action, output, refer_to, params=None):
 
     build_rules = f"""
             - Labels on the specified axis are the group names (time-stamps)
-            - Labels on the opposit of specified axis are a MultiIndex, where first level
+            - Labels on the opposite of specified axis are a MultiIndex, where first level
               contains preserved labels of this axis and the second level is the {output}.
             - Each element of QueryCompiler is the result of corresponding function for the
               corresponding group and column/row."""
@@ -442,7 +440,7 @@ def doc_resample_fillna(method, refer_to, params=None, overwrite_template_params
     method : str
         Fillna method name.
     refer_to : str
-        Method name in ``modin.pandas.base.Resampler`` module to refer to for
+        Method name in ``modin.pandas.resample.Resampler`` module to refer to for
         more information about parameters and output format.
     params : str, optional
         Method parameters in the NumPy docstyle format to substitute
@@ -535,6 +533,7 @@ doc_str_method = partial(
 
 
 def doc_window_method(
+    window_cls_name,
     result,
     refer_to,
     action=None,
@@ -543,14 +542,16 @@ def doc_window_method(
     build_rules="aggregation",
 ):
     """
-    Build decorator which adds docstring for the window method.
+    Build decorator which adds docstring for a window method.
 
     Parameters
     ----------
+    window_cls_name : str
+        The Window class the method is on.
     result : str
         The result of the method.
     refer_to : str
-        Method name in ``modin.pandas.base.Window`` module to refer to
+        Method name in ``modin.pandas.window.Window`` module to refer to
         for more information about parameters and output format.
     action : str, optional
         What method does with the created window.
@@ -567,10 +568,11 @@ def doc_window_method(
     callable
     """
     template = """
-        Create {win_type} and {action} for each window.
+        Create {win_type} and {action} for each window over the given axis.
 
         Parameters
         ----------
+        fold_axis : {{0, 1}}
         {window_args_name} : list
             Rolling windows arguments with the same signature as ``modin.pandas.DataFrame.rolling``.
         {extra_params}
@@ -578,7 +580,7 @@ def doc_window_method(
         -------
         BaseQueryCompiler
             New QueryCompiler containing {result} for each window, built by the following
-            rulles:
+            rules:
 
             {build_rules}
         """
@@ -588,14 +590,19 @@ def doc_window_method(
             - Each element is the {result} for the corresponding window.""",
         "udf_aggregation": """
             - Labels on the specified axis are preserved.
-            - Labels on the opposit of specified axis are MultiIndex, where first level
+            - Labels on the opposite of specified axis are MultiIndex, where first level
               contains preserved labels of this axis and the second level has the function names.
             - Each element of QueryCompiler is the result of corresponding function for the
               corresponding window and column/row.""",
     }
     if action is None:
         action = f"compute {result}"
-    window_args_name = "rolling_args" if win_type == "rolling window" else "window_args"
+    if win_type == "rolling window":
+        window_args_name = "rolling_kwargs"
+    elif win_type == "expanding window":
+        window_args_name = "expanding_args"
+    else:
+        window_args_name = "window_kwargs"
 
     # We need that `params` value ended with new line to have
     # an empty line between "parameters" and "return" sections
@@ -612,7 +619,7 @@ def doc_window_method(
         win_type=win_type,
         extra_params=params,
         build_rules=doc_build_rules.get(build_rules, build_rules),
-        refer_to=f"Rolling.{refer_to}",
+        refer_to=f"{window_cls_name}.{refer_to}",
         window_args_name=window_args_name,
     )
 
@@ -624,7 +631,7 @@ def doc_groupby_method(result, refer_to, action=None):
     Parameters
     ----------
     result : str
-        The result of reduction.
+        The result of reduce.
     refer_to : str
         Method name in ``modin.pandas.groupby`` module to refer to
         for more information about parameters and output format.
@@ -643,18 +650,14 @@ def doc_groupby_method(result, refer_to, action=None):
     by : BaseQueryCompiler, column or index label, Grouper or list of such
         Object that determine groups.
     axis : {{0, 1}}
-        Axis to group and apply reduction function along.
+        Axis to group and apply aggregation function along.
         0 is for index, when 1 is for columns.
-    groupby_args : dict
+    groupby_kwargs : dict
         GroupBy parameters as expected by ``modin.pandas.DataFrame.groupby`` signature.
-    map_args : dict
-        Keyword arguments to pass to the reduction function. If GroupBy is implemented via MapReduce
-        approach, this argument is passed at the map phase only.
-    reduce_args : dict, optional
-        If GroupBy is implemented with MapReduce approach, specifies arguments to pass to
-        the reduction function at the reduce phase, has no effect otherwise.
-    numeric_only : bool, default: True
-        Whether or not to drop non-numeric columns before executing GroupBy.
+    agg_args : list-like
+        Positional arguments to pass to the `agg_func`.
+    agg_kwargs : dict
+        Key arguments to pass to the `agg_func`.
     drop : bool, default: False
         If `by` is a QueryCompiler indicates whether or not by-data came
         from the `self`.
@@ -662,10 +665,10 @@ def doc_groupby_method(result, refer_to, action=None):
     Returns
     -------
     BaseQueryCompiler
-        QueryCompiler containing the result of groupby reduction built by the
+        QueryCompiler containing the result of groupby reduce built by the
         following rules:
 
-        - Labels on the opposit of specified axis are preserved.
+        - Labels on the opposite of specified axis are preserved.
         - If groupby_args["as_index"] is True then labels on the specified axis
           are the group names, otherwise labels would be default: 0, 1 ... n.
         - If groupby_args["as_index"] is False, then first N columns/rows of the frame
@@ -675,7 +678,7 @@ def doc_groupby_method(result, refer_to, action=None):
 
     .. warning
         `map_args` and `reduce_args` parameters are deprecated. They're leaked here from
-        ``PandasQueryCompiler.groupby_*``, pandas storage format implements groupby via MapReduce
+        ``PandasQueryCompiler.groupby_*``, pandas storage format implements groupby via TreeReduce
         approach, but for other storage formats these parameters make no sense, and so they'll be removed in the future.
     """
     if action is None:
